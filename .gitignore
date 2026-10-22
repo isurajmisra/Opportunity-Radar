@@ -1,0 +1,11 @@
+# Research outputs can include large excerpts and local notes. Keep them out of source control by default.
+opportunity-radar-runs/
+local-research/
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+.test-tmp/
+.opportunity-radar-backups/
+opportunity-radar-build-*/

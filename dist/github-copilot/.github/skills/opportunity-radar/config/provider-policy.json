@@ -1,0 +1,46 @@
+{
+  "_comment": "Operation caps and USD ceilings are Opportunity Radar local guardrails, not provider quotas. The Brave price basis is separately sourced below. Edit freely. Tavily credits remain governed by research-budget.json/research_ledger.py.",
+  "total_operations": {
+    "quick": 30,
+    "deep": 90
+  },
+  "estimated_cost_budget_usd": {
+    "quick": 0.05,
+    "deep": 0.15,
+    "basis": "Local ceilings derived from Brave's published $5/1,000-request list price checked 2026-10-23 and its 8/24 operation caps; estimates only, not a bill or provider plan limit. Other provider costs remain unknown and are not converted into USD."
+  },
+  "provider_operations": {
+    "quick": {
+      "tavily": 20,
+      "brave": 8,
+      "github": 12,
+      "builtin_web": 12,
+      "public_api": 12,
+      "exa": 8
+    },
+    "deep": {
+      "tavily": 60,
+      "brave": 24,
+      "github": 36,
+      "builtin_web": 36,
+      "public_api": 36,
+      "exa": 24
+    }
+  },
+  "providers": {
+    "brave": {
+      "enabled": true,
+      "cost_model": {"list_price_usd_per_1000_requests": 5.0, "published_monthly_credit_usd": 5.0, "basis": "official published prepaid Search price and monthly credit checked 2026-10-23; estimate only, account balance/credits may change marginal charge", "source": "https://api-dashboard.search.brave.com/documentation/pricing"},
+      "quota_model": "Plan-specific; capture X-RateLimit-Limit/Remaining/Reset response headers when present. Never substitute example quota values for the account's headers.",
+      "retention": "Brave API Search Results must not be stored or cached. The wrapper displays links transiently; persist no returned title, URL, snippet or result payload.",
+      "query_privacy": "Brave states API query records may be retained up to 90 days for billing and troubleshooting; do not send credentials, personal data or confidential research terms.",
+      "privacy_source": "https://api-dashboard.search.brave.com/app/documentation/general/privacy-policy",
+      "terms_source": "https://api-dashboard.search.brave.com/app/documentation/general/terms-of-service"
+    },
+    "github": {"enabled": true, "cost_model": "unknown; use authenticated or public access actually available"},
+    "builtin_web": {"enabled": true, "cost_model": "unknown/not metered by this tracker"},
+    "public_api": {"enabled": true, "cost_model": "source-dependent; record only verified usage"},
+    "exa": {"enabled": true, "cost_model": "unknown; use only when the current session exposes its tools"},
+    "tavily": {"enabled": true, "cost_model": "governed separately in research-budget.json; credits may be estimated or unknown"}
+  }
+}

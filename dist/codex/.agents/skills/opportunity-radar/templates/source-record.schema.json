@@ -1,0 +1,33 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Opportunity Radar source record",
+  "description": "Compatible machine-readable form for the existing sources.md and evidence-ledger.md. Unknown fields remain null/unknown; snippets are discovery leads until verified.",
+  "type": "object",
+  "required": ["source_id", "provider", "retrieval_method", "canonical_url", "retrieved_at", "evidence_type", "reliability_tier", "verification_status", "limitations"],
+  "properties": {
+    "source_id": {"type": "string", "pattern": "^S[0-9]{3,}$"},
+    "provider": {"type": "string"},
+    "retrieval_method": {"type": "string"},
+    "title": {"type": ["string", "null"]},
+    "canonical_url": {"type": "string", "format": "uri"},
+    "publisher": {"type": ["string", "null"]},
+    "publication_date": {"type": ["string", "null"]},
+    "event_date": {"type": ["string", "null"]},
+    "retrieved_at": {"type": "string", "format": "date-time"},
+    "country_or_market": {"type": ["string", "null"]},
+    "industry_category": {"type": ["string", "null"]},
+    "evidence_type": {"type": "string"},
+    "claim_or_finding": {"type": ["string", "null"]},
+    "excerpt_or_paraphrase": {"type": ["string", "null"]},
+    "relevance": {"type": ["string", "null"]},
+    "reliability_tier": {"enum": ["A", "B", "C", "D", "unknown"]},
+    "primary_or_secondary": {"enum": ["primary", "secondary", "unknown"]},
+    "independence_cluster": {"type": ["string", "null"]},
+    "limitations": {"type": "array", "items": {"type": "string"}},
+    "corroborating_source_ids": {"type": "array", "items": {"type": "string"}},
+    "contradicting_source_ids": {"type": "array", "items": {"type": "string"}},
+    "verification_status": {"enum": ["snippet_only", "opened", "extracted", "blocked", "failed"]},
+    "operation_id": {"type": ["string", "null"]}
+  },
+  "additionalProperties": false
+}

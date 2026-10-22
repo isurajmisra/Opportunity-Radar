@@ -1,0 +1,41 @@
+{
+  "status_values": ["fully supported", "supported with an adapter", "manual fallback", "unsupported"],
+  "hosts": {
+    "claude-code": {
+      "skill_discovery": "supported with an adapter",
+      "references_scripts": "supported with an adapter",
+      "tavily": "supported with an adapter",
+      "exa": "manual fallback",
+      "brave": "supported with an adapter",
+      "github": "supported with an adapter",
+      "parallel_agents": "supported with an adapter",
+      "founder_review": "supported with an adapter",
+      "budget_tracking": "supported with an adapter",
+      "report_persistence": "supported with an adapter"
+    },
+    "codex": {
+      "skill_discovery": "supported with an adapter",
+      "references_scripts": "supported with an adapter",
+      "tavily": "supported with an adapter",
+      "exa": "manual fallback",
+      "brave": "supported with an adapter",
+      "github": "supported with an adapter",
+      "parallel_agents": "manual fallback",
+      "founder_review": "manual fallback",
+      "budget_tracking": "supported with an adapter",
+      "report_persistence": "supported with an adapter"
+    },
+    "github-copilot": {
+      "skill_discovery": "supported with an adapter",
+      "references_scripts": "supported with an adapter",
+      "tavily": "manual fallback",
+      "exa": "manual fallback",
+      "brave": "supported with an adapter",
+      "github": "supported with an adapter",
+      "parallel_agents": "manual fallback",
+      "founder_review": "manual fallback",
+      "budget_tracking": "supported with an adapter",
+      "report_persistence": "manual fallback"
+    }
+  }
+}

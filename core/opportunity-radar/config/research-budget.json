@@ -1,0 +1,55 @@
+{
+  "_comment": "Default Tavily research budgets for Opportunity Radar. Override per run with `research_ledger.py init <run> --profile quick|deep --budget N`. Credit rates below come from the installed tavily-best-practices docs (read 2026-10-22); rows marked estimated are NOT documented there and must be reported as estimates.",
+  "profiles": {
+    "quick": {
+      "purpose": "Discover promising signals, research a small set of candidates, reject weak ones early, minimise credits.",
+      "max_candidates_to_dossier": 2,
+      "red_team_scope": "top candidate(s) that survive screening",
+      "budget_credits": 60,
+      "warn_at_fraction": 0.8,
+      "max_single_operation_credits": 10,
+      "research_calls_allowed": 0,
+      "crawl_allowed_without_approval": false,
+      "default_search_depth": "basic",
+      "default_max_results": 5
+    },
+    "deep": {
+      "purpose": "Investigate the strongest candidates: competitors, customer problems, pricing, economics, contradicting evidence; complete dossiers and validation plans.",
+      "max_candidates_to_dossier": 5,
+      "red_team_scope": "every finalist",
+      "budget_credits": 250,
+      "warn_at_fraction": 0.8,
+      "max_single_operation_credits": 30,
+      "research_calls_allowed": 2,
+      "crawl_allowed_without_approval": true,
+      "default_search_depth": "basic",
+      "default_max_results": 8
+    }
+  },
+  "credit_rates": {
+    "search": {
+      "advanced": {"credits": 2, "basis": "documented"},
+      "basic": {"credits": 1, "basis": "estimated"},
+      "fast": {"credits": 1, "basis": "estimated"},
+      "ultra-fast": {"credits": 1, "basis": "estimated"}
+    },
+    "extract": {
+      "basic": {"credits_per_5_urls": 1, "basis": "estimated (same rate as crawl extract_depth, which is documented)"},
+      "advanced": {"credits_per_5_urls": 2, "basis": "estimated (same rate as crawl extract_depth, which is documented)"}
+    },
+    "crawl": {
+      "basic": {"credits_per_5_pages": 1, "basis": "documented"},
+      "advanced": {"credits_per_5_pages": 2, "basis": "documented"},
+      "instructions": {"credits_per_10_pages": 2, "basis": "documented"}
+    },
+    "map": {
+      "base": {"credits_per_10_pages": 1, "basis": "estimated (base map cost not documented)"},
+      "instructions": {"credits_per_10_pages": 2, "basis": "documented"}
+    },
+    "research": {
+      "mini": {"reserve_credits": 30, "basis": "unknown - reservation only, not a price; calibrate from your Tavily dashboard"},
+      "pro": {"reserve_credits": 100, "basis": "unknown - reservation only, not a price; calibrate from your Tavily dashboard"},
+      "auto": {"reserve_credits": 100, "basis": "unknown - reservation only, not a price; calibrate from your Tavily dashboard"}
+    }
+  }
+}
