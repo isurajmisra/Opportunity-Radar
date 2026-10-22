@@ -2,7 +2,7 @@
 
 Opportunity Radar now has one canonical research methodology and generated Claude Code, OpenAI Codex and GitHub Copilot packages. See [CROSS-PLATFORM.md](CROSS-PLATFORM.md) for architecture, installation, provider setup, capability limits, and verification commands. See [PLATFORM-CAPABILITIES.md](PLATFORM-CAPABILITIES.md) for the host matrix.
 
-Opportunity Radar is a **private, evidence-led business discovery workflow** for agent hosts. Give it one or more countries and it researches current economic conditions, customer pain, market changes, competitors, business models, and unit economics; then it challenges candidates and designs low-cost validation experiments.
+Opportunity Radar is an **evidence-led business discovery workflow** for agent hosts. The repository is public; users can run the workflow in their own workspaces. Give it one or more countries and it researches current economic conditions, customer pain, market changes, competitors, business models, and unit economics; then it challenges candidates and designs low-cost validation experiments.
 
 It is not a generic business-idea generator and does not claim that web research proves a business will succeed. The system can identify **evidence-supported candidates**. Only real customer behaviour can establish customer or commercial validation.
 

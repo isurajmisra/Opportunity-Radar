@@ -1,11 +1,24 @@
 # Research outputs can include large excerpts and local notes. Keep them out of source control by default.
 opportunity-radar-runs/
 local-research/
+
+# Python-generated caches and local environments.
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+
+# Local credentials and environment configuration. Keep the example template tracked.
 .env
 .env.*
 !.env.example
 *.key
 *.pem
+
+# Local test and research build artifacts.
 .test-tmp/
 .opportunity-radar-backups/
 opportunity-radar-build-*/
