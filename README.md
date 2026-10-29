@@ -17,6 +17,47 @@ It is not a generic business-idea generator and does not claim that web research
 
 Country names are the only required input. The skill defaults to a solo founder, limited capital, no assumed audience, all viable business models, and a low-cost validation horizon. Optional constraints improve fit but do not force a positive result.
 
+## Running it effectively
+
+Most runs end at "exploratory hypothesis" or with zero finalists. That is by design: desk research can show that a problem and a market exist, but not that buyers will pay. These habits get the most out of each run.
+
+**1. Describe yourself, not just the country.** With only a country, the skill uses generic defaults and spreads its budget thinly. Include your skills, capital, weekly hours, time-to-revenue goal, buyer type, exclusions and, above all, any channel you already have. "Can the founder reach the first buyers?" is the gate most candidates fail.
+
+```text
+/opportunity-radar India | industry: IT/software, B2B | founder: solo SRE/software engineer |
+capital: under ₹1 lakh | time: 10 h/week | goal: first paying customer in 60 days |
+existing network: ~20 chartered-accountant firms | exclude: consumer apps, hardware | scan: quick
+```
+
+**2. Go broad once, then narrow.** A broad quick scan finds leads. A follow-up run focused on one lead, with `scan: deep`, produces the competitor, pricing and counter-evidence work that a dossier needs.
+
+```text
+/opportunity-radar India | focus: GST e-invoicing self-invoice compliance for ₹5–50 crore firms | scan: deep
+```
+
+**3. Name what earlier runs already covered.** Each run is self-contained and doesn't reuse earlier runs as evidence. List those topics in the request (e.g. `| already covered: cloud cost, DPDP`; this is free-text guidance, not a parsed field) so a new run spends its budget on new ground.
+
+**4. Expect the call limit before the credit limit.** The quick profile allows 60 estimated Tavily credits but only 20 Tavily operations (local guardrail in `config/provider-policy.json`). When a guardrail stops the run, the skill asks before continuing. Approve a specific number of operations for a specific gap (e.g. "4 more to read the official notification"), not open-ended searching.
+
+**5. Use hard caps when spend matters.** For strict limits, ask for a capped run; the ledger is then initialised with run-specific limits that can only lower the defaults:
+
+```bash
+python core/opportunity-radar/scripts/research_ledger.py init <run> --profile quick \
+  --budget 10 --max-operations 12 --max-dossiers 1 --strict-credit-bounds
+```
+
+Under a hard cap, only the guarded adapters (Tavily via `research_ledger.py run`, Brave via `brave_search.py`) may be used. Built-in web search, MCP search tools and subagent browsing are treated as unavailable, because they bypass the shared ledger.
+
+**6. Add an independent second source.** Set `BRAVE_API_KEY` to enable Brave as a second discovery index. Candidates often fail the independence gate because every lead traces back to one publisher or one press release.
+
+**7. Close the loop with real buyers.** The run ends with `validation-plan.md`: a cheap test with pass/fail thresholds set in advance. **You** run it (the skill never contacts anyone), then report back what happened, e.g. "3 of 15 firms paid for a pilot". Only that behavioural evidence can raise a candidate to customer-validated or commercially validated. Founder skills (board, competitors, pricing, CFO, offer, marketing, launch, plan) run only for candidates that pass the evidence gate.
+
+**8. Keep the installed copy current.** `/opportunity-radar` loads whichever copy your host finds, which may be an older `~/.claude/skills/opportunity-radar`. After updating this repository, reinstall (see [Install](#install)) so the ledger fixes and run caps are available.
+
+**Known quirks (Tavily CLI 0.1.8, Windows):**
+- Set `PYTHONIOENCODING=utf-8` so the ledger's digest printer doesn't fail on characters such as ₹.
+- Avoid `--chunks-per-source` on `extract`; CLI 0.1.8 rejects it with a validation error.
+
 ## What is included
 
 - Canonical methodology and skill: `core/opportunity-radar/SKILL.md`
@@ -123,17 +164,17 @@ If the Tavily CLI (`tvly`) and its skills are installed and authenticated, Oppor
 - duplicate queries and URLs are skipped;
 - blocked pages are logged as coverage gaps.
 
-Credit totals are estimates, because the CLI does not report usage. See `references/tavily-research-routing.md` and `config/research-budget.json`. Without Tavily, the skill falls back to built-in WebSearch/WebFetch as before.
+Credit totals are estimates, because the CLI does not report usage. See `references/tavily-research-routing.md` and `config/research-budget.json`. Without Tavily, the skill falls back to built-in WebSearch/WebFetch, except in a run with user-imposed hard caps. There it stops with a research-blocker note rather than use an unmetered tool.
 
 **Choosing the scan:**
 
 ```text
-/opportunity-radar India | scan: quick                      # default: 60 credits, ≤2 dossiers
-/opportunity-radar India | scan: deep                       # 250 credits, ≤5 dossiers, full red team
+/opportunity-radar India | scan: quick                      # default: 60 credits, ≤20 Tavily operations, ≤2 dossiers
+/opportunity-radar India | scan: deep                       # 250 credits, ≤60 Tavily operations, ≤5 dossiers, full red team
 /opportunity-radar India | scan: quick | research budget: 20 credits
 ```
 
-Edit `profiles` in `config/research-budget.json` to change the defaults.
+Edit `profiles` in `config/research-budget.json` to change the credit defaults, and `config/provider-policy.json` to change the operation guardrails.
 
 ### Multi-source routing and usage
 
