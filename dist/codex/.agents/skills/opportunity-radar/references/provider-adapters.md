@@ -6,10 +6,10 @@ Provider transport is selected at runtime. Claude Code, Codex, and Copilot do no
 
 | Provider | Transport | Runtime requirement | Mapping guidance |
 |---|---|---|---|
-| Tavily | Existing CLI or installed host skills through `scripts/research_ledger.py` | `tvly` installed and authenticated, or a Tavily tool actually exposed | Record provider operation, title/URL, retrieved fields, observed usage, verification status, and credit basis in the run ledger. |
-| Exa | Host-specific MCP search/fetch tools | Exa MCP configured separately in that host and visible in its tool list | Normalize the opened original page into the common record; preserve the Exa query only in the usage log if allowed. |
-| Brave | `scripts/brave_search.py` direct HTTPS API wrapper | Python, network access, and `BRAVE_API_KEY` or `BRAVE_SEARCH_API_KEY` | Search results are transient discovery leads; do not persist result payloads. Independently retrieve original pages before adding evidence records. |
-| GitHub | Host GitHub MCP or `gh api` | Search/read tools or authenticated/public CLI access | Record repository/issue/PR/release URLs and dates. Separate report counts from evidence of buyer impact. |
+| Tavily | Installed CLI through `scripts/research_ledger.py` | `tvly` installed and authenticated | Host/MCP Tavily tools are not interchangeable with the CLI schema and must not be used directly. Record operation, sources, and estimate basis in the ledger. |
+| Exa | Host-specific MCP search/fetch tools | Exa MCP configured separately in that host and visible in its tool list | Normalize the opened original page into the common record. Under a hard run cap, do not use unless a guarded adapter reserves and records the operation in the shared run ledger. |
+| Brave | `scripts/brave_search.py` guarded HTTPS API wrapper | Python, network access, and `BRAVE_API_KEY` or `BRAVE_SEARCH_API_KEY` | Checks and serializes against the shared run-operation ledger before making the request. Search results are transient discovery leads; do not persist result payloads. |
+| GitHub | Host GitHub MCP or `gh api` | Search/read tools or authenticated/public CLI access | Record repository/issue/PR/release URLs and dates. Under a hard run cap, do not use unless a guarded adapter reserves and records the operation in the shared run ledger. |
 | Hacker News | Public Firebase API or host web tools | Network/API access in the active runtime | Discussion is qualitative, self-selected evidence; retain item URL/time and do not estimate prevalence from votes/comments. |
 | PyPI | PyPI Stats endpoint or project metadata pages | Network access; third-party statistics may have their own limits/retention | Record package, interval, returned metric and dataset caveat; downloads are not unique users or paying customers. |
 | World Bank | Public API | Network access | Preserve indicator code, country, period, unit, source and revision; use only as market context. |

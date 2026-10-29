@@ -52,7 +52,7 @@ def main() -> int:
         "references/tavily-research-routing.md", "config/research-budget.json",
         "config/provider-policy.json", "scripts/brave_search.py", "scripts/init_run.py",
         "references/research-workstreams.md", "references/provider-adapters.md",
-        "scripts/provider_usage.py", "scripts/research_ledger.py", "scripts/validate_run.py",
+        "scripts/provider_usage.py", "scripts/research_ledger.py", "scripts/run_lock.py", "scripts/validate_run.py",
         "templates/source-record.schema.json", "templates/research-usage.md",
         "templates/opportunity-brief.md", "templates/sources.md", "templates/evidence-ledger.md",
         "templates/validation-plan.md", "tests/test_research_ledger.py",

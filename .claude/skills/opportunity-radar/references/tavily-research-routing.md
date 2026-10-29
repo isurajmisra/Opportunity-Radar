@@ -9,19 +9,20 @@ For other providers, use the question-specific router in `SKILL.md` and local ca
 If `tvly` is missing or unauthenticated:
 - do **not** run the install commands printed in the Tavily skills (`curl … | bash`);
 - give the user the actionable message the check prints. To sign in, the user runs `tvly login` in their own terminal (browser sign-in). Never ask the user to paste an API key into the chat.
-- use the host's available web search/fetch tools, or stop with a research-blocker note, and record the switch in `run-log.md`.
+- under a user-imposed hard cap, use another provider only through an adapter sharing the same operation ledger; otherwise stop with a research-blocker note.
 
 **Precedence.** Inside an Opportunity Radar run, this policy overrides conflicting instructions in the Tavily skills:
 - "do not fall back to other tools" — fallback is allowed and logged;
 - the install lines — never run;
 - `tvly login --api-key …` examples — never used in chat;
-- calling `tvly` directly — always go through the ledger.
+- calling `tvly` directly or using a host/MCP Tavily tool — always go through the bundled CLI ledger adapter.
 
 Tavily's command syntax, options and parameter guidance still apply.
 
 ## 1. One coordinator, shared evidence
 
-- **Only the main session runs Tavily.** Specialist agents have no Bash access. The coordinator plans queries, runs every Tavily call through `scripts/research_ledger.py run …`, and shares results with agents. It never runs `tvly` directly.
+- **Only the main session runs Tavily.** Specialist agents have no Bash access. The coordinator plans queries, runs every Tavily call through `scripts/research_ledger.py run …`, and shares results with agents. It never runs `tvly` directly or calls a host/MCP Tavily tool, whose schema and accounting can differ from the installed CLI.
+- When `--chunks-per-source` is requested, the CLI wrapper checks local `tvly extract --help`, keeps the option only when the installed version advertises it, and requires its `--query` prerequisite. This is a local help check, not a provider operation.
 - **The ledger script enforces the budget and dedupe.** Every call is checked against the run's budget and the query/URL log, and the full JSON is cached in `<run>/research-cache/`. The script prints only a compact digest, which follows the context-isolation principle of `tavily-dynamic-search`.
 - **Agent briefs must include the evidence pack:**
   - the paths to `<run>/research-ledger.json` and `<run>/research-cache/`;
@@ -102,16 +103,18 @@ Routing logic is implemented in `research_ledger.choose_operation()` and tested.
 | Research | Unknown; a configurable *reservation*, not a price |
 
   The documented CLI commands do not request/return the API's optional `include_usage` field, although the API reference documents usage fields for search, extract and crawl responses. Do not infer that the CLI reports actual credits: mark those operations as estimated under the configured basis. Research usage remains unknown unless the provider reports it. If the user supplies a dashboard figure, record it as an externally reported actual and label its source.
+
+For a user-specified strict run ceiling, initialise the ledger with run-specific limits, for example `research_ledger.py init <run> --profile quick --budget 10 --max-operations 12 --max-dossiers 1 --strict-credit-bounds`. This lowers only that run's limits; it does not change the global Quick or Deep configuration. The Tavily and bundled Brave adapters share a per-run lock and operation cap; provider attempts count even when they fail. Local command/preflight validation failures are recorded but do not count as external operations or estimated credit spend. Approvals cannot raise a run-specific hard cap. Strict mode accepts finite configured estimates or documented upper bounds, refuses unknown costs before the call, and labels estimates as estimates. Actual billed credits remain unknown unless the provider reports them. Direct host/MCP calls cannot be intercepted; do not invoke any provider outside a bundled guarded adapter under a hard cap.
 - **Decisions:**
   - `ALLOW` or `WARN` (over 80% of budget) means the call may run.
   - `NEEDS_APPROVAL` means pause and ask the user, stating the estimated cost and why. Run `approve` only after the user explicitly agrees in chat.
   - `STOP` means the budget is exhausted: ask the user before any further Tavily use.
   - `DUPLICATE` and `SKIP_KNOWN_GAP` mean reuse the cache or try a different method.
-- **Plan-limit or auth errors** (CLI exit code 3) stop Tavily use for the run. Record it, tell the user, and fall back to built-in tools if available.
+- **Plan-limit or auth errors** (CLI exit code 3) stop Tavily use for the run. Record it and tell the user. Another provider may be used only if its adapter enforces the same run-specific operation cap; otherwise stop rather than fall back to a direct host tool.
 
 ## 6. Inaccessible sources
 
-- **When a page is blocked** (403, paywall, login, CAPTCHA, timeout, empty), the ledger records it as a coverage gap. Then try permitted alternatives, in this order:
+- **When the provider confirms a source-level access failure** (for example, a source-specific 403, paywall, login, CAPTCHA), the ledger records a coverage gap. A local command/configuration error is retry eligible; a provider/network failure with no source-specific result has unknown source status. The same failed invocation or same-method extraction is not blindly repeated; correct the command/configuration or use a different permitted method before retrying. Then try permitted alternatives, in this order:
   1. `extract --depth advanced` once;
   2. the official PDF or press-release version;
   3. another reputable publisher of the same document, or an official mirror;

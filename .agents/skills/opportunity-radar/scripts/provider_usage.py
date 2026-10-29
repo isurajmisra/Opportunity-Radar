@@ -8,6 +8,16 @@ import json
 import re
 import sys
 from pathlib import Path
+from run_lock import run_lock
+
+
+LOCAL_FAILURE_STATUSES = {"invocation_failed", "preflight_failed", "not_attempted"}
+INVOCATION_ERROR = re.compile(r"(?i)(unexpected keyword argument|no such option|unrecognized arguments|invalid choice|usage:)")
+
+
+def counts_as_provider_attempt(operation: dict) -> bool:
+    return (operation.get("status") not in LOCAL_FAILURE_STATUSES and operation.get("status") != "not_run"
+            and not INVOCATION_ERROR.search(str(operation.get("error") or "")))
 
 SKILL_DIR = Path(__file__).resolve().parents[1]
 POLICY_PATH = SKILL_DIR / "config" / "provider-policy.json"
@@ -39,7 +49,8 @@ class Usage:
             if self.data["profile"] != profile:
                 raise ValueError(f"Run profile is {self.data['profile']}, not {profile}.")
         else:
-            self.data = {"created_at": now(), "profile": profile, "operations": [], "approvals": []}
+            self.data = {"created_at": now(), "profile": profile, "operations": [], "approvals": [],
+                         "report_reconciliation_version": 1}
             self.save()
 
     def save(self) -> None:
@@ -72,19 +83,31 @@ class Usage:
                     return "WAIT", f"Brave's first rate window is exhausted; wait {delay} seconds then recheck."
         tavily_path = self.run / "research-ledger.json"
         tavily_calls = 0
+        run_total_cap = None
         if tavily_path.exists():
             try:
-                tavily_calls = len(json.loads(tavily_path.read_text(encoding="utf-8")).get("operations", []))
+                tavily_data = json.loads(tavily_path.read_text(encoding="utf-8"))
+                tavily_calls = sum(counts_as_provider_attempt(x) for x in tavily_data.get("operations", []))
+                run_total_cap = tavily_data.get("settings", {}).get("total_operation_cap")
             except (json.JSONDecodeError, OSError):
                 return "STOP", "Tavily usage ledger could not be read; refusing to bypass the overall call guardrail."
-        used_total = len(self.data["operations"]) + tavily_calls
-        used_provider = sum(x["provider"] == provider for x in self.data["operations"])
+        used_total = sum(counts_as_provider_attempt(x) for x in self.data["operations"]) + tavily_calls
+        used_provider = sum(counts_as_provider_attempt(x) and x["provider"] == provider for x in self.data["operations"])
         if provider == "tavily":
             used_provider += tavily_calls
         total_cap = self.policy["total_operations"][self.profile]
         provider_cap = self.policy["provider_operations"][self.profile].get(provider, 0)
         extra_total = sum(a["extra_total_operations"] for a in self.data["approvals"])
         extra_provider = sum(a["extra_provider_operations"] for a in self.data["approvals"] if a["provider"] == provider)
+        profile_total_cap = total_cap + extra_total
+        if run_total_cap is not None:
+            try:
+                run_total_cap = int(run_total_cap)
+            except (TypeError, ValueError):
+                return "STOP", "Per-run total operation cap is invalid; refusing to call a provider."
+            if run_total_cap < 1 or run_total_cap > total_cap:
+                return "STOP", "Per-run total operation cap is invalid or exceeds the profile ceiling."
+            total_cap = min(profile_total_cap, run_total_cap)
         used_usd = sum((x.get("actual_cost") if x.get("actual_cost") is not None else x.get("estimated_cost") or 0)
                        for x in self.data["operations"] if (x.get("currency") or "USD").upper() == "USD")
         usd_cap = self.policy.get("estimated_cost_budget_usd", {}).get(self.profile, 0)
@@ -94,13 +117,44 @@ class Usage:
             return "NEEDS_APPROVAL", (f"Estimated USD cost would exceed the local estimate ceiling: "
                                        f"${projected_usd:.4f} > ${usd_cap + extra_usd:.4f}. "
                                        "This is a list-price estimate, not actual billing.")
-        if used_total >= total_cap + extra_total or used_provider >= provider_cap + extra_provider:
-            return "NEEDS_APPROVAL", (f"Local call guardrail reached (overall {used_total}/{total_cap + extra_total}; "
+        if run_total_cap is not None and used_total >= total_cap:
+            return "STOP", f"Per-run hard operation cap reached (overall {used_total}/{total_cap}); no provider call was made."
+        if used_total >= profile_total_cap or used_provider >= provider_cap + extra_provider:
+            return "NEEDS_APPROVAL", (f"Local call guardrail reached (overall {used_total}/{profile_total_cap}; "
                                        f"{provider} {used_provider}/{provider_cap + extra_provider}).")
-        return "ALLOW", (f"Local call guardrails: overall {used_total}/{total_cap + extra_total}; "
+        return "ALLOW", (f"Local call guardrails: overall {used_total}/{total_cap}; "
                          f"{provider} {used_provider}/{provider_cap + extra_provider}; "
                          f"estimated USD ${used_usd:.4f}/${usd_cap + extra_usd:.4f}. "
                          "These are not provider quotas or cost estimates.")
+
+    def reserve(self, provider: str, operation: str, query: str, estimated_cost: float | None = None,
+                estimate_basis: str | None = None) -> dict:
+        """Persist a counted reservation before I/O; caller must hold run_lock."""
+        decision, detail = self.check(provider, operation, query, estimated_cost)
+        if decision != "ALLOW":
+            raise PermissionError(f"{decision}: {detail} No provider call was made.")
+        entry = {"operation_id": f"P{len(self.data['operations']) + 1:03d}", "provider": provider,
+                 "operation": operation, "query": redact(query), "query_count": 1, "status": "in_progress",
+                 "retrieved_at": now(), "actual_cost": None, "currency": "USD" if estimated_cost is not None else None,
+                 "actual_credits": None, "estimated_cost": estimated_cost, "estimate_basis": estimate_basis,
+                 "provider_headers": {}, "cost_status": "estimated" if estimated_cost is not None else "unknown"}
+        self.data["operations"].append(entry)
+        self.save()
+        return entry
+
+    def finish(self, operation_id: str, status: str, actual_cost: float | None = None,
+               currency: str | None = None, actual_credits: float | None = None,
+               provider_headers: dict | None = None) -> dict:
+        entry = next((x for x in self.data["operations"] if x["operation_id"] == operation_id), None)
+        if entry is None or entry.get("status") != "in_progress":
+            raise ValueError("No in-progress provider reservation exists for that operation.")
+        entry.update(status=status, retrieved_at=now(), actual_cost=actual_cost, currency=currency or entry.get("currency"),
+                     actual_credits=actual_credits, provider_headers=provider_headers or {},
+                     cost_status="reported_actual" if actual_cost is not None else
+                         "reported_credits" if actual_credits is not None else
+                         "estimated" if entry.get("estimated_cost") is not None else "unknown")
+        self.save()
+        return entry
 
     def record(self, provider: str, operation: str, query: str, status: str,
                actual_cost: float | None = None, currency: str | None = None,
@@ -208,10 +262,13 @@ def main() -> int:
         return 0
     ops = usage.data["operations"]
     tavily_path = args.run / "research-ledger.json"
-    tavily_ops = len(json.loads(tavily_path.read_text(encoding="utf-8")).get("operations", [])) if tavily_path.exists() else 0
-    total_ops = len(ops) + tavily_ops
+    tavily_data = json.loads(tavily_path.read_text(encoding="utf-8")) if tavily_path.exists() else {}
+    tavily_ops = sum(counts_as_provider_attempt(x) for x in tavily_data.get("operations", []))
+    total_ops = sum(counts_as_provider_attempt(x) for x in ops) + tavily_ops
     extra_total = sum(x["extra_total_operations"] for x in usage.data["approvals"])
-    total_cap = usage.policy["total_operations"][args.profile] + extra_total
+    profile_total_cap = usage.policy["total_operations"][args.profile] + extra_total
+    run_total_cap = tavily_data.get("settings", {}).get("total_operation_cap")
+    total_cap = min(profile_total_cap, int(run_total_cap)) if run_total_cap is not None else profile_total_cap
     usd_cap = usage.policy.get("estimated_cost_budget_usd", {}).get(args.profile, 0)
     usd_cap += sum(x.get("extra_cost_usd", 0) for x in usage.data["approvals"])
     used_usd = sum((x.get("actual_cost") if x.get("actual_cost") is not None else x.get("estimated_cost") or 0)
@@ -222,7 +279,7 @@ def main() -> int:
     print(f"Estimated USD budget: ${used_usd:.4f}/${usd_cap:.4f}; ${max(usd_cap-used_usd,0):.4f} remaining "
           "(provider-specific estimates only; excludes unknown costs and Tavily credits).")
     for provider in sorted(KNOWN):
-        rows = [x for x in ops if x["provider"] == provider]
+        rows = [x for x in ops if counts_as_provider_attempt(x) and x["provider"] == provider]
         if rows:
             print(f"{provider}: {len(rows)} operations; " + ", ".join(f"{k}={sum(x['operation']==k for x in rows)}" for k in sorted({x['operation'] for x in rows})))
     print(f"Detailed ledger: {usage.path}")
@@ -250,7 +307,7 @@ def main() -> int:
     for provider in sorted(KNOWN):
         cap = usage.policy["provider_operations"][args.profile].get(provider, 0)
         extra = sum(x["extra_provider_operations"] for x in usage.data["approvals"] if x["provider"] == provider)
-        used = sum(x["provider"] == provider for x in ops)
+        used = sum(counts_as_provider_attempt(x) and x["provider"] == provider for x in ops)
         if provider == "tavily":
             used += tavily_ops
         if cap or extra:

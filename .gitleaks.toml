@@ -1,0 +1,26 @@
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "Known synthetic redaction fixture, scoped to its exact assignment lines and historical commits."
+commits = ["2ff9c85bbc259f0b31e2953189f2ad53350ee597", "d37ee22c5aeb1284c314a58077cde3fd9d9df58a"]
+paths = [
+  '''^\.agents/skills/opportunity-radar/tests/test_research_ledger\.py$''',
+  '''^\.claude/skills/opportunity-radar/tests/test_research_ledger\.py$''',
+  '''^\.github/skills/opportunity-radar/tests/test_research_ledger\.py$''',
+  '''^core/opportunity-radar/tests/test_research_ledger\.py$''',
+  '''^dist/claude-code/\.claude/skills/opportunity-radar/tests/test_research_ledger\.py$''',
+  '''^dist/codex/\.agents/skills/opportunity-radar/tests/test_research_ledger\.py$''',
+  '''^dist/github-copilot/\.github/skills/opportunity-radar/tests/test_research_ledger\.py$''',
+]
+regexes = ['''^\s*SECRET\s*=\s*["']tvly-[A-Za-z0-9_-]{12,}["']\s*(?:#.*)?$''']
+condition = "AND"
+regexTarget = "line"
+
+[[allowlists]]
+description = "Historical generated Python bytecode removed from the working tree."
+commits = ["d37ee22c5aeb1284c314a58077cde3fd9d9df58a"]
+paths = [
+  '''^core/opportunity-radar/tests/__pycache__/test_research_ledger\.cpython-312\.pyc$''',
+]
+condition = "AND"

@@ -1,0 +1,99 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  validation:
+    name: ${{ matrix.os }} / Python ${{ matrix.python-version }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        python-version: ['3.10', '3.14']
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Run core unit tests
+        run: python -m unittest discover -s core/opportunity-radar/tests -v
+
+      - name: Run cross-platform tests
+        run: python -m unittest discover -s tests/cross-platform -v
+
+      - name: Check generated distributions are current
+        run: python scripts/build-distributions.py --check
+
+      - name: Validate canonical skill and generated packages
+        run: python scripts/validate-skill.py
+
+      - name: Validate canonical package
+        run: python core/opportunity-radar/scripts/validate_package.py
+
+      - name: Validate generated packages
+        shell: bash
+        run: |
+          python dist/claude-code/.claude/skills/opportunity-radar/scripts/validate_package.py
+          python dist/codex/.agents/skills/opportunity-radar/scripts/validate_package.py
+          python dist/github-copilot/.github/skills/opportunity-radar/scripts/validate_package.py
+
+      - name: Validate saved reports
+        run: python scripts/validate-reports.py
+
+      - name: Check installer dry runs
+        shell: bash
+        run: |
+          python scripts/install.py --platform claude-code --project --target-root "$RUNNER_TEMP/or-install-claude" --dry-run
+          python scripts/install.py --platform codex --project --target-root "$RUNNER_TEMP/or-install-codex" --dry-run
+          python scripts/install.py --platform github-copilot --project --target-root "$RUNNER_TEMP/or-install-copilot" --dry-run
+
+      - name: Check Bash installer syntax
+        if: runner.os != 'Windows'
+        run: bash -n install.sh
+
+      - name: Check PowerShell installer syntax
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $tokens = $null
+          $errors = $null
+          [System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path './install.ps1'), [ref]$tokens, [ref]$errors) | Out-Null
+          if ($errors.Count -gt 0) {
+            $errors | ForEach-Object { Write-Error $_.Message }
+            exit 1
+          }
+
+  secret-scan:
+    name: Full Git history secret scan
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+    steps:
+      - name: Check out full Git history
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Scan repository history with Gitleaks
+        uses: gitleaks/gitleaks-action@e0c47f4f8be36e29cdc102c57e68cb5cbf0e8d1e # v3.0.0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITLEAKS_CONFIG: .gitleaks.toml
+          GITLEAKS_ENABLE_COMMENTS: 'false'
+          GITLEAKS_ENABLE_UPLOAD_ARTIFACT: 'false'
+          GITLEAKS_ENABLE_SUMMARY: 'false'
