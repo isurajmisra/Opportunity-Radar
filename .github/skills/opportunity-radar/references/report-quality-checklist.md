@@ -5,6 +5,8 @@ Run this before calling the research complete.
 ## Scope and transparency
 - [ ] Date, countries, constraints, assumptions, time window and tools/source-access limits are recorded.
 - [ ] `research-usage.md` records each provider/operation count, confirmed or estimated usage, unknown costs, local caps and unavailable-provider gaps.
+- [ ] Executive-summary and run-log operation totals agree with the usage ledger; local argument/preflight failures, provider-attempted failures, source access failures and unattempted sources remain distinct.
+- [ ] For a newly initialised run, the validator reconciliation block in both the executive summary and run log matches the combined ledger-entry count, provider-attempt count, and Tavily credits charged to the run budget.
 - [ ] The report says what was researched and what was not covered.
 - [ ] Any data source unavailability is visible; it was not silently replaced by model memory.
 - [ ] Multiple countries use comparable indicators or explain where comparison is not fair.

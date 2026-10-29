@@ -20,6 +20,21 @@ python -m unittest discover -s core/opportunity-radar/tests -v
 
 `dist/claude-code/`, `dist/codex/`, and `dist/github-copilot/` are self-contained packages. `--check` computes the expected package trees from canonical inputs and compares them with the generated copies without writing files. It does not access network providers.
 
+GitHub Actions runs the tests, package checks, report validation, installer dry runs, and installer syntax checks on Ubuntu, Windows, and macOS with Python 3.10 and 3.14. A separate Gitleaks job scans full Git history. CI does not call providers, require personal credentials, or rebuild generated packages. To reproduce the remaining checks locally:
+
+```text
+python -m unittest discover -s tests/cross-platform -v
+python core/opportunity-radar/scripts/validate_package.py
+python dist/claude-code/.claude/skills/opportunity-radar/scripts/validate_package.py
+python dist/codex/.agents/skills/opportunity-radar/scripts/validate_package.py
+python dist/github-copilot/.github/skills/opportunity-radar/scripts/validate_package.py
+python scripts/install.py --platform claude-code --project --target-root .test-tmp/install-claude --dry-run
+python scripts/install.py --platform codex --project --target-root .test-tmp/install-codex --dry-run
+python scripts/install.py --platform github-copilot --project --target-root .test-tmp/install-copilot --dry-run
+```
+
+Run `bash -n install.sh` on macOS/Linux. On Windows, parse `install.ps1` using PowerShell's `Parser.ParseFile`. To run the local history scan, install Gitleaks and run `gitleaks git --config .gitleaks.toml --redact --verbose` with the full repository history available.
+
 The checked-out project also carries project-local `.claude`, `.agents`, and `.github` adapters for discovery when this folder is opened directly in each host. After editing canonical files, rebuild packages, then update each project adapter with `python scripts/install.py --platform <host> --project --target-root . --force`. The updater creates a timestamped backup under `.opportunity-radar-backups/`; `validate-skill.py` detects stale project copies.
 
 ## Install and update

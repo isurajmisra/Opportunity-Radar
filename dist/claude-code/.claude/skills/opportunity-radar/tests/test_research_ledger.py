@@ -5,10 +5,14 @@ Run: python -m unittest discover -s core/opportunity-radar/tests -v
 from __future__ import annotations
 
 import json
+import io
 import shutil
 import sys
+import threading
+import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 SKILL_DIR = Path(__file__).resolve().parents[1]
 PROJECT_ROOT = next((p for p in Path(__file__).resolve().parents if (p / "opportunity-radar-runs").is_dir()), None)
@@ -130,7 +134,319 @@ class TestDeduplication(LedgerTestCase):
         self.assertNotIn("https://www.example.gov/report/?utm_campaign=y", runner.calls[-1])
 
 
+class TestCliCompatibilityAndCoverage(LedgerTestCase):
+    def test_extract_arguments_match_installed_cli_option_conventions(self):
+        args = rl.build_tvly_args("extract", ["https://example.gov/report"], {
+            "depth": "basic", "query": "find revenue and costs", "chunks_per_source": 3})
+        self.assertEqual(args, ["extract", "https://example.gov/report", "--extract-depth", "basic",
+                                "--query", "find revenue and costs", "--chunks-per-source", "3", "--json"])
+        runner = FakeRunner([(0, json.dumps({"results": [{"url": "https://example.gov/report",
+                                                           "raw_content": "mocked extract"}]}), "")])
+        rl.run_operation(self.ledger, "extract", ["https://example.gov/report"], {
+            "depth": "basic", "query": "find revenue and costs", "chunks_per_source": 3}, runner)
+        self.assertEqual(runner.calls[0], args)
+        with self.assertRaisesRegex(ValueError, "requires --query"):
+            rl.build_tvly_args("extract", ["https://example.gov/report"], {"chunks_per_source": 3})
+
+    def test_missing_version_option_is_removed_after_local_help_probe(self):
+        completed = mock.Mock(returncode=0, stdout='{"results": []}', stderr="")
+        with mock.patch.object(rl.shutil, "which", return_value="tvly.exe"), \
+             mock.patch.object(rl, "_extract_cli_options", return_value={"--query", "--extract-depth"}), \
+             mock.patch.object(rl.subprocess, "run", return_value=completed) as process:
+            result = rl._subprocess_runner(["extract", "https://example.gov", "--query", "q",
+                                            "--chunks-per-source", "3", "--json"], 30)
+        self.assertEqual(result[0], 0)
+        self.assertNotIn("--chunks-per-source", process.call_args.args[0])
+        self.assertIn("--query", process.call_args.args[0])
+
+    def test_cli_argument_error_does_not_create_gap_and_corrected_retry_succeeds(self):
+        url = "https://example.gov/report"
+        runner = FakeRunner([
+            (1, "", "ValidationError: unexpected keyword argument chunks_per_source"),
+            (0, json.dumps({"results": [{"url": url, "raw_content": "Verified report text"}]}), ""),
+        ])
+        failed = rl.run_operation(self.ledger, "extract", [url],
+                                  {"depth": "basic", "query": "find the official data", "chunks_per_source": 3}, runner)
+        self.assertEqual(failed["entry"]["status"], "invocation_failed")
+        self.assertFalse(failed["entry"]["provider_reached"])
+        self.assertEqual(self.ledger.data["coverage_gaps"], [])
+        self.assertEqual(self.ledger.spent, 0)
+        same = self.ledger.plan("extract", [url],
+                                {"depth": "basic", "query": "find the official data", "chunks_per_source": 3})
+        self.assertEqual(same["status"], rl.STOP)
+        retry = rl.run_operation(self.ledger, "extract", [url],
+                                 {"depth": "basic", "query": "find the official data"}, runner)
+        self.assertTrue(retry["executed"])
+        self.assertTrue(self.ledger.data["sources"][rl.normalize_url(url)]["extracted"])
+        self.assertEqual(len(self.ledger.data["coverage_gaps"]), 0)
+        attempts = self.ledger.data["sources"][rl.normalize_url(url)]["attempts"]
+        self.assertEqual(len(attempts), 2)
+        self.assertIn("retry eligible", attempts[0]["status"])
+        self.assertIn("successful", attempts[1]["status"])
+        self.assertEqual(sum(rl.counts_as_provider_attempt(x) for x in self.ledger.data["operations"]), 1)
+
+    def test_report_distinguishes_real_access_denial_from_unknown_failure(self):
+        runner = FakeRunner([(0, json.dumps({"results": [], "failed_results": [
+            {"url": "https://denied.example", "error": "HTTP 403 Forbidden"},
+            {"url": "https://unknown.example", "error": "upstream timeout"}]}), "")])
+        rl.run_operation(self.ledger, "extract", ["https://denied.example", "https://unknown.example"], {}, runner)
+        summary = self.ledger.summary_markdown()
+        self.assertIn("source access failed", summary)
+        self.assertIn("source status unknown; retry eligible", summary)
+        self.assertEqual([g["url"] for g in self.ledger.data["coverage_gaps"]], ["https://denied.example"])
+        self.assertIn("attempt history", summary.casefold())
+        retry_same = self.ledger.plan("extract", ["https://unknown.example"], {"depth": "basic"})
+        self.assertEqual(retry_same["status"], rl.STOP)
+        retry_corrected = self.ledger.plan("extract", ["https://unknown.example"], {"depth": "advanced"})
+        self.assertIn(retry_corrected["status"], rl.RUNNABLE)
+        for operation in self.ledger.data["operations"]:
+            self.assertIn(f"| {operation['id']} |", summary)
+            self.assertIn(f"| {operation['status']} |", summary)
+        for operation in self.ledger.data["operations"]:
+            self.assertIn(f"| {operation['id']} |", summary)
+            self.assertIn(f"| {operation['status']} |", summary)
+
+    def test_legacy_invocation_error_is_not_rendered_as_source_access_failure(self):
+        url = "https://example.gov/legacy"
+        normalized = rl.normalize_url(url)
+        error = "ValidationError: unexpected keyword argument chunks_per_source"
+        self.ledger.data["operations"].append({"id": "Q001", "tool": "tavily", "op": "extract",
+            "target": [url], "params": {"depth": "basic"}, "key": "old", "status": "failed",
+            "est_credits": 1, "credit_basis": "estimated", "actual_credits": None,
+            "retrieved_at": rl.now(), "cache_file": None, "error": error, "result_urls": []})
+        self.ledger.data["sources"][normalized] = {"url": url, "first_seen": "Q001", "extracted": False,
+            "published_date": None, "retrieved_at": rl.now(), "seen_in": ["Q001"]}
+        self.ledger.data["coverage_gaps"].append({"url": url, "normalized_url": normalized,
+            "reason": error, "operation": "Q001", "method": "tavily extract basic", "alternatives_tried": [],
+            "impact": "not yet assessed", "recorded_at": rl.now()})
+        summary = self.ledger.summary_markdown()
+        self.assertIn("invocation_failed (retry eligible)", summary)
+        self.assertIn("command failed; retry eligible", summary)
+        self.assertNotIn("source access failed", summary)
+        self.assertIn("0 provider attempts", summary)
+        self.assertEqual(self.ledger.spent, 0)
+
+
+class TestWindowsConsoleReporting(LedgerTestCase):
+    class RestrictiveStream:
+        encoding = "cp1252"
+
+        def __init__(self):
+            self.parts = []
+
+        def write(self, value):
+            value.encode(self.encoding, errors="strict")
+            self.parts.append(value)
+
+    def test_unicode_report_escapes_safely_on_restrictive_console(self):
+        stream = self.RestrictiveStream()
+        rl.safe_print("Cost ₹100 💸; extraction failed: upstream timeout", file=stream)
+        rendered = "".join(stream.parts)
+        self.assertIn("Cost", rendered)
+        self.assertIn("upstream timeout", rendered)
+        self.assertIn("\\u20b9", rendered)
+        self.assertTrue("\\U0001f4b8" in rendered or "\\u" in rendered)
+
+    def test_summary_is_saved_and_console_output_is_safe(self):
+        url = "https://example.gov/₹-💸"
+        self.ledger.record(self.ledger.plan("search", ["report"], {}), "ok", [{"url": url, "title": "₹ 💸"}])
+        stream = self.RestrictiveStream()
+        with mock.patch.object(rl.sys, "stdout", stream):
+            status = rl.main(["summary", str(self.run_dir)])
+        self.assertEqual(status, 0)
+        report = (self.run_dir / rl.USAGE_NAME).read_text(encoding="utf-8")
+        self.assertIn(url, report)
+        self.assertIn("Wrote", "".join(stream.parts))
+
+    def test_useful_failure_text_is_printed_but_credentials_are_redacted(self):
+        stream = self.RestrictiveStream()
+        message = rl.redact("extract failed: timeout api_key=DO_NOT_SHOW tvly-ABCDEF123456")
+        rl.safe_print(message, file=stream)
+        rendered = "".join(stream.parts)
+        self.assertIn("extract failed: timeout", rendered)
+        self.assertNotIn("DO_NOT_SHOW", rendered)
+        self.assertNotIn("tvly-ABCDEF123456", rendered)
+
+
 class TestBudget(LedgerTestCase):
+    def test_concurrent_requests_cannot_oversubscribe_last_operation(self):
+        from concurrent.futures import ThreadPoolExecutor
+        led = rl.Ledger.init(self.run_dir, "quick", max_operations=1)
+        started = threading.Barrier(3)
+        calls = []
+
+        def worker(query):
+            started.wait(timeout=3)
+            def runner(args, timeout):
+                calls.append(args)
+                time.sleep(0.05)
+                return 0, json.dumps({"results": []}), ""
+            return rl.run_operation(rl.Ledger.load(self.run_dir), "search", [query], {"depth": "advanced"}, runner)
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            futures = [pool.submit(worker, "last-slot-a"), pool.submit(worker, "last-slot-b")]
+            started.wait(timeout=3)
+            results = [f.result(timeout=5) for f in futures]
+        self.assertEqual(sum(bool(x["executed"]) for x in results), 1)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(sum(rl.counts_as_provider_attempt(x) for x in rl.Ledger.load(self.run_dir).data["operations"]), 1)
+
+    def test_interrupted_reserved_operation_keeps_slot_consumed(self):
+        led = rl.Ledger.init(self.run_dir, "quick", max_operations=1)
+        decision = led.plan("search", ["interrupted call"], {"depth": "advanced"})
+        reserved = led.record(decision, "in_progress")
+        self.assertTrue(reserved["provider_reached"])
+        runner = FakeRunner()
+        blocked = rl.run_operation(led, "search", ["another call"], {"depth": "advanced"}, runner)
+        self.assertEqual(blocked["decision"]["status"], rl.STOP)
+        self.assertEqual(runner.calls, [])
+
+    def test_concurrent_tavily_and_other_provider_share_the_same_cap(self):
+        from concurrent.futures import ThreadPoolExecutor
+        from provider_usage import Usage, load_policy
+        led = rl.Ledger.init(self.run_dir, "quick", max_operations=1)
+        start = threading.Barrier(3)
+        calls = []
+
+        def tavily():
+            start.wait(timeout=3)
+            def runner(args, timeout):
+                calls.append("tavily")
+                time.sleep(0.05)
+                return 0, json.dumps({"results": []}), ""
+            return rl.run_operation(rl.Ledger.load(self.run_dir), "search", ["shared tavily"],
+                                    {"depth": "advanced"}, runner)
+
+        def other_provider():
+            start.wait(timeout=3)
+            with rl.run_lock(self.run_dir):
+                usage = Usage(self.run_dir, "quick", load_policy())
+                try:
+                    entry = usage.reserve("builtin_web", "search", "shared other-provider query")
+                    calls.append("builtin_web")
+                    return entry
+                except PermissionError:
+                    return None
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            futures = [pool.submit(tavily), pool.submit(other_provider)]
+            start.wait(timeout=3)
+            results = [f.result(timeout=5) for f in futures]
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(sum(bool(x is not None and (x.get("executed") or x.get("operation_id")))
+                             for x in results), 1)
+
+    def test_run_specific_total_operation_cap_blocks_later_provider_calls(self):
+        from provider_usage import Usage, load_policy
+        led = rl.Ledger.init(self.run_dir, "quick", budget=10, max_operations=1,
+                             max_dossiers=1, strict_credit_bounds=True)
+        runner = FakeRunner([(0, json.dumps({"results": []}), "")])
+        first = rl.run_operation(led, "search", ["first query"], {"depth": "advanced"}, runner)
+        self.assertTrue(first["executed"])
+        second = rl.run_operation(led, "search", ["second query"], {"depth": "advanced"}, runner)
+        self.assertFalse(second["executed"])
+        self.assertEqual(second["decision"]["status"], rl.STOP)
+        self.assertIn("per-run hard operation cap", second["decision"]["reason"])
+        usage = Usage(self.run_dir, "quick", load_policy())
+        decision, _ = usage.check("builtin_web", "search", "external follow-up")
+        self.assertEqual(decision, "STOP")
+        usage.data["approvals"].append({"provider": "builtin_web", "extra_provider_operations": 5,
+                                         "extra_total_operations": 5, "extra_cost_usd": 0})
+        usage.save()
+        decision, _ = usage.check("builtin_web", "search", "follow-up after approval")
+        self.assertEqual(decision, "STOP")
+        self.assertEqual(len(runner.calls), 1)
+
+    def test_strict_run_credit_bound_refuses_estimate_that_would_exceed_budget(self):
+        led = rl.Ledger.init(self.run_dir, "quick", budget=3, max_operations=12,
+                             max_dossiers=1, strict_credit_bounds=True)
+        runner = FakeRunner([(0, json.dumps({"results": []}), "")])
+        first = rl.run_operation(led, "search", ["first advanced query"], {"depth": "advanced"}, runner)
+        self.assertTrue(first["executed"])
+        second = rl.run_operation(led, "search", ["second advanced query"], {"depth": "advanced"}, runner)
+        self.assertFalse(second["executed"])
+        self.assertEqual(second["decision"]["status"], rl.STOP)
+        self.assertIn("strict run credit cap", second["decision"]["reason"])
+        led.approve(credits=100, reason="test that approval cannot override strict cap")
+        self.assertEqual(led.limit, 3)
+        self.assertEqual(len(runner.calls), 1)
+
+    def test_estimated_tavily_operation_that_would_exceed_budget_is_blocked(self):
+        led = rl.Ledger.init(self.run_dir, "quick", budget=2)
+        runner = FakeRunner([(0, json.dumps({"results": []}), "")])
+        first = rl.run_operation(led, "search", ["documented-cost query"], {"depth": "advanced"}, runner)
+        self.assertTrue(first["executed"])
+        second = rl.run_operation(led, "search", ["estimated-cost query"], {"depth": "basic"}, runner)
+        self.assertFalse(second["executed"])
+        self.assertEqual(second["decision"]["status"], rl.STOP)
+        self.assertEqual(led.spent, 2)
+        self.assertEqual(len(runner.calls), 1)
+
+    def test_strict_run_allows_configured_estimate_but_refuses_unknown_costs(self):
+        led = rl.Ledger.init(self.run_dir, "quick", budget=10, strict_credit_bounds=True)
+        runner = FakeRunner()
+        estimated = rl.run_operation(led, "search", ["estimated rate"], {"depth": "basic"}, runner)
+        self.assertTrue(estimated["executed"])
+        self.assertEqual(estimated["decision"]["basis"], "estimated")
+        result = rl.run_operation(led, "research", ["unknown cost"], {"model": "mini"}, runner)
+        self.assertFalse(result["executed"])
+        self.assertEqual(result["decision"]["status"], rl.STOP)
+        self.assertIn("finite configured estimate or documented pre-call bound", result["decision"]["reason"])
+        self.assertEqual(len(runner.calls), 1)
+
+    def test_failed_tavily_operation_consumes_operation_slot_and_blocks_next_call(self):
+        led = rl.Ledger.init(self.run_dir, "quick", max_operations=1)
+        runner = FakeRunner([(1, "", "temporary provider failure"), (0, "{}", "")])
+        failed = rl.run_operation(led, "search", ["first failed query"], {"depth": "advanced"}, runner)
+        self.assertTrue(failed["executed"])
+        self.assertEqual(failed["entry"]["status"], "provider_failed_unknown")
+        blocked = rl.run_operation(led, "search", ["next query"], {"depth": "advanced"}, runner)
+        self.assertFalse(blocked["executed"])
+        self.assertEqual(blocked["decision"]["status"], rl.STOP)
+        self.assertEqual(len(runner.calls), 1)
+
+    def test_failed_non_tavily_operation_is_counted_before_next_check(self):
+        from provider_usage import Usage, load_policy
+        rl.Ledger.init(self.run_dir, "quick", max_operations=1)
+        usage = Usage(self.run_dir, "quick", load_policy())
+        with rl.run_lock(self.run_dir):
+            reserved = usage.reserve("builtin_web", "search", "first provider query")
+            decision, _ = usage.check("builtin_web", "search", "second provider query")
+            self.assertEqual(decision, "STOP")
+            usage.finish(reserved["operation_id"], "failed")
+        decision, _ = usage.check("builtin_web", "search", "second provider query")
+        self.assertEqual(decision, "STOP")
+        self.assertEqual(len(usage.data["operations"]), 1)
+
+    def test_run_specific_limits_do_not_change_global_budgets(self):
+        from provider_usage import load_policy
+        config = rl.load_config()
+        policy = load_policy()
+        led = rl.Ledger.init(self.run_dir, "quick", budget=10, max_operations=12,
+                             max_dossiers=1, strict_credit_bounds=True)
+        self.assertEqual(led.limit, 10)
+        self.assertEqual(led.data["settings"]["total_operation_cap"], 12)
+        self.assertEqual(led.data["settings"]["max_candidates_to_dossier"], 1)
+        self.assertEqual(config["profiles"]["quick"]["budget_credits"], 60)
+        self.assertEqual(config["profiles"]["deep"]["budget_credits"], 250)
+        self.assertEqual(policy["total_operations"]["quick"], 30)
+        self.assertEqual(policy["total_operations"]["deep"], 90)
+
+    def test_run_specific_caps_cannot_raise_profile_limits(self):
+        with self.assertRaises(ValueError):
+            rl.Ledger.init(self.run_dir / "too-many-ops", "quick", max_operations=31)
+        with self.assertRaises(ValueError):
+            rl.Ledger.init(self.run_dir / "too-many-dossiers", "quick", max_dossiers=3)
+
+    def test_dossier_prewrite_guard_blocks_second_dossier(self):
+        led = rl.Ledger.init(self.run_dir, "quick", max_dossiers=1)
+        self.assertTrue(led.dossier_capacity()[0])
+        (self.run_dir / "opportunities").mkdir()
+        (self.run_dir / "opportunities" / "first.md").write_text("fixture", encoding="utf-8")
+        allowed, message = led.dossier_capacity()
+        self.assertFalse(allowed)
+        self.assertIn("limit reached", message)
+
     def test_stops_before_exceeding_budget(self):
         runner = FakeRunner([(0, json.dumps({"results": []}), "")] * 100)
         executed = 0
@@ -170,7 +486,7 @@ class TestBudget(LedgerTestCase):
         runner = FakeRunner([(3, json.dumps({"error": "usage limit exceeded"}), "")])
         res = rl.run_operation(self.ledger, "search", ["x"], {}, runner)
         self.assertTrue(res["stop"])
-        self.assertEqual(res["entry"]["status"], "blocked_by_plan_or_auth")
+        self.assertEqual(res["entry"]["status"], "preflight_failed")
 
 
 class TestSourceReferences(LedgerTestCase):
@@ -320,6 +636,25 @@ class TestCredentials(LedgerTestCase):
         self.assertIn("ready", msg)
         self.assertEqual(runner.calls, [["--status", "--json"]])  # status only: no search, no credits
 
+    def test_preflight_permission_error_is_not_misreported_as_authentication_failure(self):
+        runner = FakeRunner([(1, "", "PermissionError: [WinError 5] Access is denied")])
+        ok, msg = rl.preflight(runner)
+        self.assertFalse(ok)
+        self.assertIn("could not access", msg)
+        self.assertIn("authentication status was not verified", msg)
+        self.assertNotIn("WinError", msg)
+
+    def test_auth_config_permission_error_during_run_is_not_a_provider_attempt(self):
+        error = "[WinError 5] Access is denied: 'C:\\\\Users\\\\test\\\\.tavily'"
+        runner = FakeRunner([(1, "", error)])
+        res = rl.run_operation(self.ledger, "search", ["India cloud costs"], {"depth": "basic"}, runner)
+        self.assertEqual(res["entry"]["status"], "preflight_failed")
+        self.assertTrue(res["stop"])
+        self.assertFalse(res["entry"]["provider_reached"])
+        self.assertEqual(self.ledger.spent, 0)
+        self.assertEqual(sum(rl.counts_as_provider_attempt(x) for x in self.ledger.data["operations"]), 0)
+        self.assertIn("no provider request was made", res["message"])
+
     def test_auth_error_during_run_is_redacted_and_stops(self):
         runner = FakeRunner([(3, "", f"Unauthorized: key {self.SECRET}")])
         res = rl.run_operation(self.ledger, "search", ["india"], {}, runner)
@@ -373,6 +708,16 @@ class TestAuditWarnings(LedgerTestCase):
         self.assertFalse(any(w.startswith("E03") for w in warnings))
         self.assertEqual(rl.audit_run(self.run_dir), [])  # warnings never block
 
+    def test_incidental_snippet_word_does_not_mark_full_source_as_snippet_only(self):
+        (self.run_dir / "sources.md").write_text(
+            "| Source ID | Fetched | Limitations |\n|---|---|---|\n"
+            "| S001 | Full page | Earlier search snippet was not used. |\n", encoding="utf-8")
+        (self.run_dir / "evidence-ledger.md").write_text(
+            "| Evidence ID | Evidence class | Source ID(s) | Corroborated by (independent) |\n|---|---|---|---|\n"
+            "| E01 | FACT | S001 | none found |\n", encoding="utf-8")
+        self.assertFalse(any("E01" in warning and "snippet-only" in warning
+                             for warning in rl.audit_warnings(self.run_dir)))
+
 
 class TestExistingWorkflowsStillWork(unittest.TestCase):
     skill = SKILL_DIR
@@ -384,6 +729,70 @@ class TestExistingWorkflowsStillWork(unittest.TestCase):
     def test_package_structure_checks_pass(self):
         res = self._run(self.skill / "scripts" / "validate_package.py")
         self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
+
+    def test_run_validator_enforces_run_specific_dossier_limit(self):
+        tmp = TEMP_BASE / "dossier-cap"
+        if tmp.exists():
+            shutil.rmtree(tmp)
+        (tmp / "opportunities").mkdir(parents=True)
+        (tmp / "opportunities" / "one.md").write_text("one", encoding="utf-8")
+        (tmp / "opportunities" / "two.md").write_text("two", encoding="utf-8")
+        (tmp / "research-ledger.json").write_text(json.dumps({
+            "settings": {"max_candidates_to_dossier": 1}
+        }), encoding="utf-8")
+        try:
+            res = self._run(self.skill / "scripts" / "validate_run.py", tmp)
+            self.assertEqual(res.returncode, 1)
+            self.assertIn("Dossier limit exceeded", res.stdout)
+        finally:
+            shutil.rmtree(tmp)
+
+    def test_run_validator_reconciles_summary_and_log_totals_with_both_ledgers(self):
+        tmp = TEMP_BASE / "usage-reconciliation"
+        if tmp.exists():
+            shutil.rmtree(tmp)
+        run = tmp / "run"
+        (run / "opportunities").mkdir(parents=True)
+        (run / "research-ledger.json").write_text(json.dumps({
+            "settings": {"max_candidates_to_dossier": 1, "report_reconciliation_version": 1},
+            "operations": [
+                {"id": "Q001", "status": "ok", "est_credits": 1, "actual_credits": None},
+                {"id": "Q002", "status": "invocation_failed", "est_credits": 1, "actual_credits": None},
+            ],
+        }), encoding="utf-8")
+        (run / "provider-usage.json").write_text(json.dumps({"operations": [
+            {"operation_id": "P001", "provider": "brave", "status": "ok"},
+            {"operation_id": "P002", "provider": "brave", "status": "invocation_failed"},
+        ]}), encoding="utf-8")
+        block = ("<!-- OPPORTUNITY_RADAR_USAGE_START -->\n"
+                 "- Ledger entries (all providers): 4\n"
+                 "- Provider attempts (all providers): 2\n"
+                 "- Tavily credits charged to run budget: 1\n"
+                 "<!-- OPPORTUNITY_RADAR_USAGE_END -->\n")
+        for name in ("00-executive-summary.md", "run-log.md"):
+            (run / name).write_text("# Report\n\n" + block, encoding="utf-8")
+        for name in ("01-country-snapshot.md", "02-signal-inventory.md", "03-opportunity-shortlist.md",
+                     "evidence-ledger.md", "red-team-review.md", "validation-plan.md", "founder-review.md"):
+            (run / name).write_text("# Report\n", encoding="utf-8")
+        (run / "sources.md").write_text(
+            "https://one.example https://two.example https://three.example\n", encoding="utf-8")
+        (run / "research-usage.md").write_text(
+            "- Operation attempts: 2 (1 provider attempts); unique sources seen: 0; extracted: 0\n"
+            "- Credits used: **1 (estimated** unless provider-reported\n"
+            "- Local profile: **quick**; tracked operations: **2** (including 1 Tavily; local guardrail: 30 total)\n",
+            encoding="utf-8")
+        try:
+            script = self.skill / "scripts" / "validate_run.py"
+            good = self._run(script, run)
+            self.assertEqual(good.returncode, 0, good.stdout + good.stderr)
+            log = run / "run-log.md"
+            log.write_text(log.read_text(encoding="utf-8").replace(
+                "Provider attempts (all providers): 2", "Provider attempts (all providers): 9"), encoding="utf-8")
+            bad = self._run(script, run)
+            self.assertEqual(bad.returncode, 1)
+            self.assertIn("run-log.md usage reconciliation provider_attempts is 9", bad.stdout)
+        finally:
+            shutil.rmtree(tmp)
 
     def test_new_run_scaffold_validates_without_tavily(self):
         tmp = TEMP_BASE / "init-run-scaffold"

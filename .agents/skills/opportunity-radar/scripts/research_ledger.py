@@ -6,7 +6,7 @@ work; enforces the run's credit budget; records inaccessible sources as coverage
 gaps; and audits that claims cite known sources. Standard library only.
 
 Typical use (from the run's coordinator session, never from a subagent):
-  python research_ledger.py init  <run> --profile quick
+  python research_ledger.py init  <run> --profile quick --budget 10 --max-operations 12 --max-dossiers 1 --strict-credit-bounds
   python research_ledger.py plan  <run> search "india msme delayed payments" --include-domains rbi.org.in
   python research_ledger.py run   <run> search "india msme delayed payments" --include-domains rbi.org.in
   python research_ledger.py run   <run> extract "https://example.gov/report.pdf"
@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import argparse
 import datetime as _dt
+from functools import lru_cache
 import json
 import math
 import os
@@ -29,6 +30,7 @@ import sys
 from pathlib import Path
 from typing import Callable
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+from run_lock import run_lock
 
 SKILL_DIR = Path(__file__).resolve().parents[1]
 DEFAULT_CONFIG = SKILL_DIR / "config" / "research-budget.json"
@@ -40,7 +42,7 @@ OPS = ("search", "extract", "map", "crawl", "research")
 # max_results, chunk counts) does not make a repeated query a new query.
 KEY_PARAMS = ("depth", "topic", "time_range", "start_date", "end_date", "include_domains",
               "exclude_domains", "country", "include_raw_content", "query", "instructions",
-              "select_paths", "exclude_paths", "max_depth", "limit", "model")
+              "select_paths", "exclude_paths", "max_depth", "limit", "model", "chunks_per_source")
 TRACKING_PARAMS = re.compile(r"^(utm_.*|gclid|fbclid|mc_cid|mc_eid|ref|ref_src)$", re.I)
 SECRET_PATTERNS = (re.compile(r"tvly-[A-Za-z0-9_\-]{6,}"),
                    re.compile(r"(?i)(api[_-]?key|token|secret|password)(\s*[=:]\s*)\S+|(bearer)(\s+)[A-Za-z0-9._\-]{16,}"))
@@ -48,6 +50,44 @@ SECRET_PATTERNS = (re.compile(r"tvly-[A-Za-z0-9_\-]{6,}"),
 ALLOW, WARN, DUPLICATE, NEEDS_APPROVAL, STOP, SKIP_KNOWN_GAP = (
     "ALLOW", "WARN", "DUPLICATE", "NEEDS_APPROVAL", "STOP", "SKIP_KNOWN_GAP")
 RUNNABLE = (ALLOW, WARN)
+LOCAL_FAILURE_STATUSES = {"invocation_failed", "preflight_failed", "not_attempted"}
+INVOCATION_ERROR = re.compile(
+    r"(?i)(unexpected keyword argument|no such option|unrecognized arguments|invalid choice|usage:)" )
+AUTH_CONFIG_ACCESS_ERROR = re.compile(
+    r"(?i)(permissionerror|permission denied|access is denied|winerror\s*5|eacces).*\.tavily|"
+    r"\.tavily.*(permissionerror|permission denied|access is denied|winerror\s*5|eacces)"
+)
+
+
+def counts_as_provider_attempt(operation: dict) -> bool:
+    """Known local failures are logged but did not consume a provider operation."""
+    return (operation.get("status") not in LOCAL_FAILURE_STATUSES and operation.get("status") != "not_run"
+            and not INVOCATION_ERROR.search(str(operation.get("error") or "")))
+
+
+def local_invocation_error(operation: dict | None) -> bool:
+    return bool(operation and (operation.get("status") in LOCAL_FAILURE_STATUSES
+                               or INVOCATION_ERROR.search(str(operation.get("error") or ""))))
+
+
+def auth_config_access_error(message: str) -> bool:
+    """Recognize local Tavily credential-directory access failures, not provider 401/403s."""
+    return bool(AUTH_CONFIG_ACCESS_ERROR.search(message or ""))
+
+
+def safe_print(*values, file=None, sep=" ", end="\n") -> None:
+    """Write Unicode normally, but escape unsupported characters on restrictive consoles."""
+    stream = file or sys.stdout
+    text = sep.join(str(value) for value in values) + end
+    try:
+        stream.write(text)
+    except UnicodeEncodeError:
+        encoding = getattr(stream, "encoding", None) or "ascii"
+        stream.write(text.encode(encoding, errors="backslashreplace").decode(encoding))
+
+
+def md_cell(value) -> str:
+    return re.sub(r"\s+", " ", str(value or "")).replace("|", "/").strip()
 
 STATUS_ORDER = ["Insufficient evidence", "Signal detected", "Exploratory hypothesis",
                 "Evidence-supported candidate", "Customer-validated", "Commercially validated"]
@@ -154,11 +194,26 @@ class Ledger:
     # ---------- persistence ----------
     @classmethod
     def init(cls, run_dir: Path, profile: str = "quick", budget: int | None = None,
-             config: dict | None = None) -> "Ledger":
+             config: dict | None = None, max_operations: int | None = None,
+             max_dossiers: int | None = None, strict_credit_bounds: bool = False) -> "Ledger":
         config = config or load_config()
         settings = dict(config["profiles"][profile])
+        provider_policy = json.loads((SKILL_DIR / "config" / "provider-policy.json").read_text(encoding="utf-8"))
+        global_operation_cap = int(provider_policy["total_operations"][profile])
+        if max_operations is not None and not 1 <= int(max_operations) <= global_operation_cap:
+            raise ValueError(f"max_operations must be between 1 and the {profile} global cap ({global_operation_cap}).")
+        dossier_limit = int(settings["max_candidates_to_dossier"])
+        if max_dossiers is not None and not 0 <= int(max_dossiers) <= dossier_limit:
+            raise ValueError(f"max_dossiers must be between 0 and the {profile} profile limit ({dossier_limit}).")
         if budget is not None:
+            if int(budget) < 1:
+                raise ValueError("budget must be at least 1 credit.")
             settings["budget_credits"] = int(budget)
+        settings["total_operation_cap"] = int(max_operations) if max_operations is not None else None
+        settings["max_candidates_to_dossier"] = int(max_dossiers) if max_dossiers is not None else dossier_limit
+        settings["require_documented_credit_bounds"] = bool(strict_credit_bounds)
+        settings["hard_credit_cap"] = int(settings["budget_credits"]) if strict_credit_bounds else None
+        settings["report_reconciliation_version"] = 1
         data = {"created_at": now(), "profile": profile, "settings": settings,
                 "rates": config["credit_rates"], "approved_extra_credits": 0,
                 "approved_research_calls": 0, "approved_crawl": False, "approvals": [],
@@ -181,12 +236,14 @@ class Ledger:
     # ---------- accounting ----------
     @property
     def limit(self) -> int:
-        return self.data["settings"]["budget_credits"] + self.data["approved_extra_credits"]
+        limit = self.data["settings"]["budget_credits"] + self.data["approved_extra_credits"]
+        hard_cap = self.data["settings"].get("hard_credit_cap")
+        return min(limit, int(hard_cap)) if hard_cap is not None else limit
 
     @property
     def spent(self) -> int:
         return sum(op.get("actual_credits") if op.get("actual_credits") is not None else op["est_credits"]
-                   for op in self.data["operations"] if op["status"] != "not_run")
+                   for op in self.data["operations"] if counts_as_provider_attempt(op))
 
     def op_key(self, op: str, target: list[str], params: dict) -> str:
         if op == "extract":
@@ -214,13 +271,25 @@ class Ledger:
         approvals = usage.get("approvals", [])
         extra_total = sum(x.get("extra_total_operations", 0) for x in approvals)
         extra_tavily = sum(x.get("extra_provider_operations", 0) for x in approvals if x.get("provider") == "tavily")
-        other_calls = sum(x.get("provider") != "tavily" for x in usage.get("operations", []))
-        tavily_calls = sum(x.get("status") != "not_run" for x in self.data["operations"])
+        other_calls = sum(counts_as_provider_attempt(x) and x.get("provider") != "tavily"
+                          for x in usage.get("operations", []))
+        tavily_calls = sum(counts_as_provider_attempt(x) for x in self.data["operations"])
         total = other_calls + tavily_calls
-        total_limit = policy["total_operations"][self.data["profile"]] + extra_total
+        profile_cap = policy["total_operations"][self.data["profile"]]
+        profile_total_limit = profile_cap + extra_total
+        run_total_limit = self.data["settings"].get("total_operation_cap")
+        if run_total_limit is not None:
+            try:
+                run_total_limit = int(run_total_limit)
+            except (TypeError, ValueError):
+                return "local run operation cap is invalid; refusing to run."
+            if not 1 <= run_total_limit <= profile_cap:
+                return "local run operation cap is invalid; refusing to run."
+        total_limit = min(profile_total_limit, run_total_limit) if run_total_limit is not None else profile_total_limit
         tavily_limit = policy["provider_operations"][self.data["profile"]]["tavily"] + extra_tavily
         if total >= total_limit or tavily_calls >= tavily_limit:
-            return (f"local call guardrail reached (total {total}/{total_limit}; "
+            label = "per-run hard operation cap" if run_total_limit is not None and total >= run_total_limit else "local call guardrail"
+            return (f"{label} reached (total {total}/{total_limit}; "
                     f"Tavily {tavily_calls}/{tavily_limit}); ask the user before continuing.")
         return None
 
@@ -231,29 +300,52 @@ class Ledger:
         settings = self.data["settings"]
         decision = {"op": op, "target": target, "params": params, "notes": []}
         if op == "extract":
-            pending, done, gaps = [], [], []
+            pending, done, gaps, retry_blocked = [], [], [], []
+            method = f"tavily extract {params.get('depth') or 'basic'}"
             for url in target:
                 n = normalize_url(url)
                 src = self.data["sources"].get(n)
                 if src and src.get("extracted"):
                     done.append(url)
-                elif any(g["normalized_url"] == n and g.get("method") == f"tavily extract {params.get('depth') or 'basic'}"
+                elif any(g["normalized_url"] == n and g.get("method") == method
+                         and g.get("status", "source_access_failed") == "source_access_failed"
                          for g in self.data["coverage_gaps"]):
                     gaps.append(url)
+                elif src and any(a.get("method") == method and "status unknown" in a.get("status", "")
+                                 for a in src.get("attempts", [])[-1:]):
+                    retry_blocked.append(url)
                 else:
                     pending.append(url)
             if done:
                 decision["notes"].append(f"already extracted, reuse cache: {done}")
             if gaps:
                 decision["notes"].append(f"known coverage gaps with this method, try a permitted alternative: {gaps}")
+            if retry_blocked:
+                decision["notes"].append(f"same-method retry refused for sources with unknown status; change method/configuration first: {retry_blocked}")
             if not pending:
-                decision.update(status=SKIP_KNOWN_GAP if gaps and not done else DUPLICATE,
-                                est_credits=0, basis="n/a")
+                if gaps:
+                    for gap in self.data["coverage_gaps"]:
+                        if gap["normalized_url"] in {normalize_url(url) for url in gaps}:
+                            gap["retry_status"] = "intentionally skipped; use a different permitted method"
+                    self.save()
+                if retry_blocked:
+                    decision.update(status=STOP, reason="retry requires a corrected command/configuration or a different permitted method")
+                else:
+                    decision.update(status=SKIP_KNOWN_GAP if gaps and not done else DUPLICATE,
+                                    est_credits=0, basis="n/a")
                 return decision
             target = decision["target"] = pending
         key = self.op_key(op, target, params)
         for prior in self.data["operations"]:
-            if prior["key"] == key and prior["status"] == "ok":
+            if prior["key"] == key and prior["status"] == "in_progress":
+                decision.update(status=STOP, reason=("a previous provider operation was interrupted with unknown outcome; "
+                                                     "review the ledger before attempting a retry"))
+                return decision
+            if prior["key"] == key and prior["status"] == "invocation_failed":
+                decision.update(status=STOP, reason=("the same CLI invocation already failed locally; "
+                                                     "correct the command/configuration before retrying"))
+                return decision
+            if prior["key"] == key and prior["status"] == "ok" and op != "extract":
                 wanted = params.get("max_results") or 0
                 if wanted <= (prior["params"].get("max_results") or 0) or op != "search":
                     decision.update(status=DUPLICATE, est_credits=0, basis="n/a",
@@ -262,10 +354,21 @@ class Ledger:
                 decision["notes"].append("expands an earlier identical query to more results")
         local_limit = self.local_operation_guard()
         if local_limit:
-            decision.update(status=NEEDS_APPROVAL, reason=local_limit)
+            status = STOP if local_limit.startswith("per-run hard operation cap") else NEEDS_APPROVAL
+            decision.update(status=status, reason=local_limit)
             return decision
         est, basis = estimate_credits(op, params, self.data["rates"], n_urls=len(target))
         decision.update(est_credits=est, basis=basis, key=key)
+        if settings.get("require_documented_credit_bounds") and (
+                not isinstance(est, int) or est < 0 or "unknown" in basis.casefold()):
+            decision.update(status=STOP, reason=(f"strict run budget requires a finite configured estimate or "
+                                                 f"documented pre-call bound; {op} cost is {basis}. "
+                                                 "No provider call was made."))
+            return decision
+        if settings.get("require_documented_credit_bounds") and self.spent + est > self.limit:
+            decision.update(status=STOP, reason=(f"operation's documented bound would exceed the strict run credit cap: "
+                                                 f"{self.spent} + {est} > {self.limit}. No provider call was made."))
+            return decision
         if self.spent >= self.limit:
             decision.update(status=STOP, reason=f"budget exhausted ({self.spent}/{self.limit} est. credits); ask the user")
             return decision
@@ -294,14 +397,22 @@ class Ledger:
     def record(self, decision: dict, status: str, result_items: list[dict] | None = None,
                cache_file: str | None = None, error: str | None = None,
                actual_credits: int | None = None, tool: str = "tavily") -> dict:
-        op_id = f"Q{len(self.data['operations']) + 1:03d}"
-        entry = {"id": op_id, "tool": tool, "op": decision["op"], "target": decision["target"],
-                 "params": decision["params"], "key": decision.get("key") or self.op_key(
-                     decision["op"], decision["target"], decision["params"]),
-                 "status": status, "est_credits": 0 if tool != "tavily" else decision.get("est_credits", 0),
-                 "credit_basis": decision.get("basis"), "actual_credits": actual_credits,
-                 "retrieved_at": now(), "cache_file": cache_file, "error": redact(error),
-                 "result_urls": []}
+        reserved_id = decision.get("reserved_id")
+        entry = next((x for x in self.data["operations"] if x["id"] == reserved_id), None) if reserved_id else None
+        if entry is None:
+            op_id = f"Q{len(self.data['operations']) + 1:03d}"
+            entry = {"id": op_id, "tool": tool, "op": decision["op"], "target": decision["target"],
+                     "params": decision["params"], "key": decision.get("key") or self.op_key(
+                         decision["op"], decision["target"], decision["params"]),
+                     "status": status, "est_credits": 0 if tool != "tavily" else decision.get("est_credits", 0),
+                     "credit_basis": decision.get("basis"), "actual_credits": actual_credits,
+                     "retrieved_at": now(), "cache_file": cache_file, "error": redact(error),
+                     "provider_reached": counts_as_provider_attempt({"status": status}), "result_urls": []}
+        else:
+            op_id = entry["id"]
+            entry.update(status=status, retrieved_at=now(), cache_file=cache_file or entry.get("cache_file"),
+                         error=redact(error), actual_credits=actual_credits,
+                         provider_reached=counts_as_provider_attempt({"status": status}))
         for item in result_items or []:
             url = item.get("url")
             if not url:
@@ -310,24 +421,93 @@ class Ledger:
             entry["result_urls"].append(url)
             src = self.data["sources"].setdefault(n, {"url": url, "first_seen": op_id, "extracted": False,
                                                     "title": item.get("title"), "published_date": None,
-                                                    "retrieved_at": entry["retrieved_at"], "seen_in": []})
-            src["seen_in"].append(op_id)
+                                                    "retrieved_at": entry["retrieved_at"], "seen_in": [],
+                                                    "extraction_status": "snippet only", "attempts": []})
+            if op_id not in src["seen_in"]:
+                src["seen_in"].append(op_id)
             if item.get("published_date") and not src.get("published_date"):
                 src["published_date"] = item["published_date"]
             if item.get("raw_content"):  # full page text retrieved (extract, crawl, or search --include-raw-content)
                 src["extracted"] = True
                 src["retrieved_at"] = entry["retrieved_at"]
-        self.data["operations"].append(entry)
+                src["extraction_status"] = "full page"
+        if decision["op"] == "extract":
+            for url in decision["target"]:
+                n = normalize_url(url)
+                src = self.data["sources"].setdefault(n, {"url": url, "first_seen": op_id, "extracted": False,
+                                                          "published_date": None, "retrieved_at": entry["retrieved_at"],
+                                                          "seen_in": [], "extraction_status": "not attempted", "attempts": []})
+                if op_id not in src["seen_in"]:
+                    src["seen_in"].append(op_id)
+                if src.get("extracted"):
+                    attempt_status = "successful extraction"
+                    src["extraction_status"] = "full page"
+                    for previous in src.get("attempts", []):
+                        if previous.get("retry_status") == "retry eligible":
+                            previous["retry_status"] = f"retried successfully by {op_id}"
+                elif status == "invocation_failed":
+                    attempt_status = "command/configuration failure (retry eligible)"
+                    src["extraction_status"] = "command failed; retry eligible"
+                elif status == "preflight_failed":
+                    attempt_status = "preflight failure (not attempted)"
+                    src["extraction_status"] = "not attempted; preflight failed"
+                elif status == "in_progress":
+                    attempt_status = "provider attempt in progress; source status unknown"
+                    src["extraction_status"] = "provider attempt in progress; outcome unknown"
+                elif status == "source_access_failed":
+                    attempt_status = "confirmed source-level access failure"
+                    src["extraction_status"] = "source access failed"
+                elif status == "provider_failed_unknown":
+                    attempt_status = "provider/network failure; source status unknown"
+                    src["extraction_status"] = "source status unknown; retry eligible"
+                elif status == "ok":
+                    attempt_status = "provider returned no full-page content; source status unknown"
+                    src["extraction_status"] = "source status unknown; retry eligible"
+                else:
+                    attempt_status = status
+                    src["extraction_status"] = status
+                attempt = {"operation_id": op_id,
+                    "method": f"tavily extract {decision['params'].get('depth') or 'basic'}",
+                    "status": attempt_status, "reason": redact(error), "retrieved_at": entry["retrieved_at"]}
+                if attempt_status.endswith("retry eligible") or "status unknown" in attempt_status:
+                    attempt["retry_status"] = "retry eligible"
+                prior_attempt = next((a for a in src.setdefault("attempts", [])
+                                      if a.get("operation_id") == op_id), None)
+                if prior_attempt is None:
+                    src["attempts"].append(attempt)
+                else:
+                    prior_attempt.update(attempt)
+        if not reserved_id:
+            self.data["operations"].append(entry)
         self.save()
         return entry
 
     def record_gap(self, url: str, reason: str, op_id: str | None = None, method: str | None = None,
-                   tried: list[str] | None = None, impact: str | None = None) -> dict:
+                   tried: list[str] | None = None, impact: str | None = None,
+                   status: str = "source_access_failed") -> dict:
+        normalized = normalize_url(url)
         gap = {"url": url, "normalized_url": normalize_url(url), "reason": redact(reason),
                "operation": op_id, "method": method, "alternatives_tried": tried or [],
+               "status": status, "retry_status": "alternative method required" if status == "source_access_failed" else "retry eligible",
                "impact": redact(impact) or "not yet assessed", "recorded_at": now(),
                "note": "Coverage limitation only - not evidence that demand or the fact is absent."}
-        self.data["coverage_gaps"].append(gap)
+        existing = next((g for g in self.data["coverage_gaps"] if g["normalized_url"] == normalized
+                         and g.get("method") == method and g.get("operation") == op_id), None)
+        if existing is None:
+            self.data["coverage_gaps"].append(gap)
+        else:
+            existing.update(gap)
+            gap = existing
+        src = self.data["sources"].setdefault(normalized, {"url": url, "first_seen": op_id,
+                                                           "extracted": False, "published_date": None,
+                                                           "retrieved_at": now(), "seen_in": [], "attempts": []})
+        src["extraction_status"] = "source access failed" if status == "source_access_failed" else status
+        src.setdefault("attempts", [])
+        if op_id and not any(a.get("operation_id") == op_id for a in src["attempts"]):
+            src["attempts"].append({"operation_id": op_id, "method": method,
+                "status": "confirmed source-level access failure" if status == "source_access_failed" else status,
+                "reason": redact(reason), "retrieved_at": gap["recorded_at"],
+                "retry_status": gap["retry_status"]})
         self.save()
         return gap
 
@@ -349,6 +529,9 @@ class Ledger:
         if budget is not None:
             settings["budget_credits"] = int(budget)
         old = self.data["profile"]
+        for key in ("total_operation_cap", "max_candidates_to_dossier", "require_documented_credit_bounds", "hard_credit_cap"):
+            if key in self.data["settings"]:
+                settings[key] = self.data["settings"][key]
         self.data["profile"], self.data["settings"] = profile, settings
         self.data["approvals"].append({"credits": 0, "research_calls": 0, "allow_crawl": False,
                                        "reason": redact(f"profile {old} -> {profile}: {reason}"), "at": now()})
@@ -361,13 +544,18 @@ class Ledger:
     # ---------- reporting ----------
     def summary_markdown(self) -> str:
         d, s = self.data, self.data["settings"]
+        op_limit = s.get("total_operation_cap") or "profile default"
         lines = ["# Research usage", "",
                  f"- Profile: **{d['profile']}**; budget {s['budget_credits']} credits"
                  f" + approved extra {d['approved_extra_credits']} = **{self.limit}**",
+                 f"- Run limits: **{op_limit} total operations**, "
+                 f"**{s.get('max_candidates_to_dossier', 'profile default')} dossiers maximum**; "
+                 f"documented credit bounds only: **{'yes' if s.get('require_documented_credit_bounds') else 'no'}**",
                  f"- Credits used: **{self.spent} (estimated** unless an operation lists actual credits; "
                  "the Tavily CLI does not report usage, see `config/research-budget.json` for the basis of each rate)",
                  f"- Remaining: **{self.remaining} (estimated)**",
-                 f"- Operations: {len(d['operations'])}; unique sources seen: {len(d['sources'])}; "
+                 f"- Operation attempts: {len(d['operations'])} ({sum(counts_as_provider_attempt(x) for x in d['operations'])} provider attempts); "
+                 f"unique sources seen: {len(d['sources'])}; "
                  f"extracted: {sum(1 for x in d['sources'].values() if x.get('extracted'))}",
                  "- Research volume is recorded for audit only and never raises an opportunity's score.", "",
                  "## Operations", "",
@@ -375,29 +563,64 @@ class Ledger:
                  "|---|---|---|---|---|---:|---|---|---:|"]
         for o in d["operations"]:
             target = "; ".join(o["target"])[:120].replace("|", "/")
-            lines.append(f"| {o['id']} | {o['tool']} | {o['op']} | {target} | {o['status']} | {o['est_credits']} | "
+            display_status = "invocation_failed (retry eligible)" if local_invocation_error(o) else o['status']
+            lines.append(f"| {o['id']} | {o['tool']} | {o['op']} | {target} | {display_status} | {o['est_credits']} | "
                          f"{o.get('credit_basis') or ''} | {o['retrieved_at']} | {len(o['result_urls'])} |")
         lines += ["", "## Sources seen", "",
                   "Snippet-only sources are discovery leads; extract the page before using them for a material claim.", "",
-                  "| URL | Fetched | Published | First retrieved (UTC) | Seen in |", "|---|---|---|---|---|"]
-        gap_urls = {g["normalized_url"] for g in d["coverage_gaps"]}
+                  "| URL | Fetched / status | Published | First retrieved (UTC) | Seen in | Attempt history |",
+                  "|---|---|---|---|---|---|"]
+        operation_by_id = {o["id"]: o for o in d["operations"]}
+        true_gaps = [g for g in d["coverage_gaps"] if not local_invocation_error(
+            operation_by_id.get(g.get("operation")))]
+        gap_urls = {g["normalized_url"] for g in true_gaps}
         for n, src in d["sources"].items():
-            fetched = "full page" if src.get("extracted") else ("blocked" if n in gap_urls else "snippet only")
+            source_local_error = next((operation_by_id.get(g.get("operation")) for g in d["coverage_gaps"]
+                                       if g["normalized_url"] == n and local_invocation_error(
+                                           operation_by_id.get(g.get("operation")))), None)
+            fetched = src.get("extraction_status") or (
+                "full page" if src.get("extracted") else
+                "command failed; retry eligible" if source_local_error else
+                "source access failed" if n in gap_urls else "snippet only")
+            attempt_rows = list(src.get("attempts", []))
+            if not attempt_rows and source_local_error:
+                attempt_rows = [{"operation_id": source_local_error.get("id"),
+                                 "status": "command/configuration failure", "reason": source_local_error.get("error"),
+                                 "retry_status": "retry eligible"}]
+            attempts = "; ".join(
+                f"{a.get('operation_id')} {md_cell(a.get('status'))}: {md_cell(a.get('reason') or 'no error')}"
+                f" [{a.get('retry_status')}]" if a.get("retry_status") else
+                f"{a.get('operation_id')} {md_cell(a.get('status'))}: {md_cell(a.get('reason') or 'no error')}"
+                for a in attempt_rows) or "none"
             lines.append(f"| {src['url']} | {fetched} | {src.get('published_date') or 'unknown'} | "
-                         f"{src.get('retrieved_at')} | {', '.join(src.get('seen_in', []))} |")
+                         f"{src.get('retrieved_at')} | {', '.join(src.get('seen_in', []))} | {attempts} |")
         lines += ["", "## Coverage gaps", ""]
-        if not d["coverage_gaps"]:
+        if not true_gaps:
             lines.append("None recorded.")
         else:
             lines += ["Inaccessible sources are coverage limitations, **not evidence that demand is absent**.", "",
-                      "| URL | Reason | Method | Alternatives tried | Impact on research |", "|---|---|---|---|---|"]
-            for g in d["coverage_gaps"]:
-                lines.append(f"| {g['url']} | {g['reason']} | {g.get('method') or ''} | "
-                             f"{', '.join(g['alternatives_tried']) or 'none yet'} | {g.get('impact', 'not yet assessed')} |")
+                      "| URL | Status | Reason | Method | Retry status | Alternatives tried | Impact on research |",
+                      "|---|---|---|---|---|---|---|"]
+            for g in true_gaps:
+                lines.append(f"| {g['url']} | {md_cell(g.get('status', 'source_access_failed'))} | {md_cell(g['reason'])} | "
+                             f"{md_cell(g.get('method'))} | {md_cell(g.get('retry_status', 'alternative method required'))} | "
+                             f"{md_cell(', '.join(g['alternatives_tried']) or 'none yet')} | {md_cell(g.get('impact', 'not yet assessed'))} |")
         lines += ["", "## Approvals", ""]
         lines += [f"- {a['at']}: +{a['credits']} credits, +{a['research_calls']} research calls, "
                   f"crawl={a['allow_crawl']} — {a['reason']}" for a in d["approvals"]] or ["None."]
         return "\n".join(lines) + "\n"
+
+    def dossier_capacity(self) -> tuple[bool, str]:
+        """Pre-write guard used by the coordinator before creating each dossier."""
+        try:
+            limit = int(self.data["settings"]["max_candidates_to_dossier"])
+        except (KeyError, TypeError, ValueError):
+            return False, "Run dossier limit is missing or invalid; refusing to create a dossier."
+        directory = self.run_dir / "opportunities"
+        current = len(list(directory.glob("*.md"))) if directory.is_dir() else 0
+        if current >= limit:
+            return False, f"Run dossier limit reached ({current}/{limit}); do not create another dossier."
+        return True, f"Dossier slot available ({current}/{limit}); one dossier may be created."
 
 
 # ---------- running the Tavily CLI ----------
@@ -409,6 +632,14 @@ def build_tvly_args(op: str, target: list[str], params: dict) -> list[str]:
             "chunks_per_source": "--chunks-per-source", "instructions": "--instructions", "limit": "--limit",
             "max_depth": "--max-depth", "select_paths": "--select-paths", "exclude_paths": "--exclude-paths",
             "model": "--model"}
+    if params.get("chunks_per_source") is not None:
+        if op not in ("extract", "crawl"):
+            raise ValueError("--chunks-per-source is supported only for extract/crawl operations")
+        if not params.get("query"):
+            raise ValueError("Tavily CLI requires --query when --chunks-per-source is used")
+        chunks = int(params["chunks_per_source"])
+        if not 1 <= chunks <= 5:
+            raise ValueError("Tavily CLI --chunks-per-source must be between 1 and 5")
     args = [op] + ([" ".join(target)] if op in ("search", "research") else list(target))
     for k, v in params.items():
         if v in (None, False, ""):
@@ -424,21 +655,44 @@ def build_tvly_args(op: str, target: list[str], params: dict) -> list[str]:
 
 AUTH_HELP = ("Tavily is not signed in, or the plan limit was reached. Ask the user to run `tvly login` "
              "in their own terminal (browser sign-in), then retry. Never ask the user to paste an API key "
-             "into the chat. If this is a plan limit, stop Tavily use and tell the user. Meanwhile, fall back "
-             "to host-provided web search/fetch tools if available, and note the switch in run-log.md.")
+             "into the chat. If this is a plan limit, stop Tavily use and tell the user. Under a hard run cap, "
+             "use another provider only through an adapter that checks and records against the same run cap; "
+             "otherwise stop and report the provider as unavailable.")
 INSTALL_HELP = ("The Tavily CLI (`tvly`) was not found on PATH. Ask the user to install it with "
                 "`pip install --user tavily-cli` (do not run remote `curl | bash` scripts), add its Scripts "
-                "folder to PATH, and run `tvly login`. Until then, use host-provided web search/fetch tools.")
+                "folder to PATH, and run `tvly login`. Until then, use only a provider adapter that enforces "
+                "the same run-specific operation cap; do not fall back to an unmetered host tool.")
 
 
 def _subprocess_runner(args: list[str], timeout: int) -> tuple[int, str, str]:
     exe = shutil.which("tvly")
     if not exe:
         return 127, "", INSTALL_HELP
+    command_args = list(args)
+    if command_args and command_args[0] == "extract" and "--chunks-per-source" in command_args:
+        options = _extract_cli_options(exe)
+        if options is None:
+            return 126, "", "Could not verify installed Tavily CLI extract options; no provider call was made."
+        if "--chunks-per-source" not in options:
+            index = command_args.index("--chunks-per-source")
+            del command_args[index:index + 2]
     env = dict(os.environ, PYTHONUTF8="1", PYTHONIOENCODING="utf-8")
-    proc = subprocess.run([exe] + args, capture_output=True, text=True, encoding="utf-8",
+    proc = subprocess.run([exe] + command_args, capture_output=True, text=True, encoding="utf-8",
                           errors="replace", timeout=timeout, env=env)
     return proc.returncode, proc.stdout, proc.stderr
+
+
+@lru_cache(maxsize=8)
+def _extract_cli_options(exe: str) -> set[str] | None:
+    """Read local CLI help once to handle installed-version option differences."""
+    try:
+        proc = subprocess.run([exe, "extract", "--help"], capture_output=True, text=True,
+                              encoding="utf-8", errors="replace", timeout=20)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if proc.returncode != 0:
+        return None
+    return set(re.findall(r"--[a-z][a-z0-9-]*", proc.stdout + proc.stderr))
 
 
 def result_items(op: str, payload: dict) -> list[dict]:
@@ -449,41 +703,86 @@ def result_items(op: str, payload: dict) -> list[dict]:
     return list(payload.get("results", []))
 
 
-def run_operation(ledger: Ledger, op: str, target: list[str], params: dict,
-                  runner: Callable[[list[str], int], tuple[int, str, str]] = _subprocess_runner) -> dict:
+def is_source_access_failure(reason: str) -> bool:
+    return bool(re.search(r"(?i)(\bHTTP\s*)?(401|403|404|410)\b|paywall|login required|captcha", reason or ""))
+
+
+def _run_operation_locked(ledger: Ledger, op: str, target: list[str], params: dict,
+                          runner: Callable[[list[str], int], tuple[int, str, str]]) -> dict:
     decision = ledger.plan(op, target, params)
     if decision["status"] not in RUNNABLE:
         return {"decision": decision, "executed": False}
-    args = build_tvly_args(op, decision["target"], params)
-    code, out, err = runner(args, 700 if op == "research" else 180)
+    try:
+        args = build_tvly_args(op, decision["target"], params)
+    except (TypeError, ValueError) as exc:
+        message = redact(str(exc))
+        decision.update(status=STOP, reason=f"Local CLI argument validation failed. {message} No provider call was made.")
+        entry = ledger.record(decision, "invocation_failed", error=message)
+        return {"decision": decision, "executed": False, "entry": entry, "message": message}
+    reserved = ledger.record(decision, "in_progress")
+    decision["reserved_id"] = reserved["id"]
+    try:
+        code, out, err = runner(args, 700 if op == "research" else 180)
+    except (OSError, subprocess.SubprocessError) as exc:
+        code, out, err = 126, "", f"{type(exc).__name__}: local CLI invocation failed"
     payload: dict = {}
     try:
         payload = json.loads(out) if out.strip() else {}
     except json.JSONDecodeError:
         payload = {"error": "non-JSON output"}
     if code != 0 or "error" in payload:
-        message = redact(payload.get("error") or err or f"exit {code}")
-        status = "blocked_by_plan_or_auth" if code == 3 else "failed"
+        raw_error = str(payload.get("error") or err or f"exit {code}")
+        local_invocation_error = code in (2, 126) or bool(re.search(
+            r"(?i)(unexpected keyword argument|no such option|unrecognized arguments|invalid choice|usage:)", raw_error))
+        config_access_error = auth_config_access_error(raw_error)
+        status = ("preflight_failed" if code in (3, 127) or config_access_error else
+                  "invocation_failed" if local_invocation_error else "provider_failed_unknown")
+        message = ("Tavily CLI could not read its existing authentication configuration; "
+                   "no provider request was made. Retry only after granting the CLI read access."
+                   if config_access_error else redact(raw_error))
         entry = ledger.record(decision, status, error=message)
-        if op == "extract":
-            for url in decision["target"]:
-                ledger.record_gap(url, message, entry["id"], f"tavily extract {params.get('depth') or 'basic'}")
-        elif op in ("map", "crawl"):
-            ledger.record_gap(decision["target"][0], message, entry["id"], f"tavily {op}")
-        stop = code in (3, 127)
+        stop = code in (3, 127) or config_access_error
         help_text = AUTH_HELP if code == 3 else INSTALL_HELP if code == 127 else message
         return {"decision": decision, "executed": True, "entry": entry, "stop": stop, "message": help_text}
     cache_dir = ledger.run_dir / CACHE_DIR
     cache_dir.mkdir(exist_ok=True)
-    op_id = f"Q{len(ledger.data['operations']) + 1:03d}"
+    op_id = decision["reserved_id"]
     cache_file = f"{CACHE_DIR}/{op_id}-{op}.json"
     (ledger.run_dir / cache_file).write_text(json.dumps(payload, indent=1), encoding="utf-8")
     entry = ledger.record(decision, "ok", result_items(op, payload), cache_file)
     for failed in payload.get("failed_results", []) or []:
         url = failed.get("url") if isinstance(failed, dict) else str(failed)
         reason = failed.get("error", "extraction failed") if isinstance(failed, dict) else "extraction failed"
-        ledger.record_gap(url, str(reason), entry["id"], f"tavily {op} {params.get('depth') or 'basic'}")
+        n = normalize_url(url)
+        src = ledger.data["sources"].setdefault(n, {"url": url, "first_seen": entry["id"], "extracted": False,
+                                                     "published_date": None, "retrieved_at": entry["retrieved_at"],
+                                                     "seen_in": [], "attempts": []})
+        if entry["id"] not in src["seen_in"]:
+            src["seen_in"].append(entry["id"])
+        source_denied = is_source_access_failure(str(reason))
+        src["extraction_status"] = "source access failed" if source_denied else "source status unknown; retry eligible"
+        attempt = next((a for a in src.setdefault("attempts", []) if a.get("operation_id") == entry["id"]), None)
+        if attempt is None:
+            attempt = {"operation_id": entry["id"], "method": f"tavily {op} {params.get('depth') or 'basic'}",
+                       "retrieved_at": entry["retrieved_at"]}
+            src["attempts"].append(attempt)
+        attempt.update(
+            status="confirmed source-level access failure" if source_denied else "provider returned a source failure; status unknown",
+            reason=redact(str(reason)), retrieved_at=entry["retrieved_at"],
+            retry_status="alternative method required" if source_denied else "retry eligible")
+        if source_denied:
+            ledger.record_gap(url, str(reason), entry["id"], f"tavily {op} {params.get('depth') or 'basic'}")
+    ledger.save()
     return {"decision": decision, "executed": True, "entry": entry, "payload": payload}
+
+
+def run_operation(ledger: Ledger, op: str, target: list[str], params: dict,
+                  runner: Callable[[list[str], int], tuple[int, str, str]] = _subprocess_runner) -> dict:
+    """Serialize Tavily pre-call checks and calls with other provider adapters for this run."""
+    with run_lock(ledger.run_dir):
+        current = Ledger.load(ledger.run_dir)
+        ledger.data = current.data
+        return _run_operation_locked(ledger, op, target, params, runner)
 
 
 def preflight(runner: Callable[[list[str], int], tuple[int, str, str]] = _subprocess_runner) -> tuple[bool, str]:
@@ -503,6 +802,10 @@ def preflight(runner: Callable[[list[str], int], tuple[int, str, str]] = _subpro
         status = {}
     if code != 0 or not status.get("authenticated"):
         detail = redact((err or "").strip().splitlines()[-1]) if (err or "").strip() else "not authenticated"
+        if re.search(r"permissionerror|permission denied|access is denied|winerror\s*5|eacces", detail, re.I):
+            return False, ("Tavily CLI could not access its existing authentication configuration. "
+                           "Run this no-credit check in a context allowed to read the user configuration; "
+                           "authentication status was not verified.")
         return False, f"{AUTH_HELP} (detail: {detail})"
     return True, f"Tavily CLI ready (version {status.get('version', 'unknown')}, authenticated)."
 
@@ -510,16 +813,16 @@ def preflight(runner: Callable[[list[str], int], tuple[int, str, str]] = _subpro
 def compact_print(op: str, payload: dict, limit: int = 400) -> None:
     """Print a short digest; full output stays in the cache file."""
     if op == "research":
-        print(str(payload.get("content", ""))[:1500])
+        safe_print(redact(str(payload.get("content", ""))[:1500]))
     for item in result_items(op, payload)[:30]:
         bits = [f"{item.get('score', 0):.2f}" if isinstance(item.get("score"), (int, float)) else "",
                 item.get("published_date") or "", item.get("title") or "", item.get("url", "")]
-        print(" | ".join(b for b in bits if b))
+        safe_print(redact(" | ".join(b for b in bits if b)))
         text = item.get("raw_content") or item.get("content") or ""
         if text and op != "map":
-            print("   " + re.sub(r"\s+", " ", text)[:limit])
+            safe_print(redact("   " + re.sub(r"\s+", " ", text)[:limit]))
     for failed in payload.get("failed_results", []) or []:
-        print(f"FAILED (coverage gap): {failed}")
+        safe_print(f"Extraction results need review; see the coverage status in research-usage.md: {redact(str(failed))}")
 
 
 # ---------- audits ----------
@@ -560,7 +863,7 @@ def audit_run(run_dir: Path) -> list[str]:
     return problems
 
 
-SNIPPET_MARK = re.compile(r"(?i)\bsnippet only\b|\(snippet\)|^snippet$")
+SNIPPET_MARK = re.compile(r"(?i)^\s*(?:snippet only|snippet)(?:\s|$)")
 
 
 def audit_warnings(run_dir: Path) -> list[str]:
@@ -570,8 +873,12 @@ def audit_warnings(run_dir: Path) -> list[str]:
     src_path, led_path = run_dir / "sources.md", run_dir / "evidence-ledger.md"
     if not (src_path.exists() and led_path.exists()):
         return warnings
+    def is_snippet_only(row: dict) -> bool:
+        fetched = next((value for key, value in row.items() if key.strip().casefold().startswith("fetched")), "")
+        return bool(SNIPPET_MARK.search(fetched or ""))
+
     snippet_only = {r.get("Source ID", "") for r in _table_rows(src_path.read_text(encoding="utf-8"))
-                    if any(SNIPPET_MARK.search(v or "") for v in r.values())}
+                    if is_snippet_only(r)}
     for row in _table_rows(led_path.read_text(encoding="utf-8")):
         ids = re.findall(r"S\d{3,}", row.get("Source ID(s)", ""))
         if row.get("Evidence class", "").upper().startswith("FACT") and ids and all(i in snippet_only for i in ids):
@@ -674,6 +981,10 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("run_dir", type=Path)
     p.add_argument("--profile", choices=("quick", "deep"), default="quick")
     p.add_argument("--budget", type=int)
+    p.add_argument("--max-operations", type=int, help="per-run total provider-operation ceiling; may only lower the profile cap")
+    p.add_argument("--max-dossiers", type=int, help="per-run dossier ceiling; may only lower the profile cap")
+    p.add_argument("--strict-credit-bounds", action="store_true",
+                   help="refuse Tavily operations without a finite configured estimate or documented pre-call bound")
     _add_op_args(sub.add_parser("plan"))
     _add_op_args(sub.add_parser("run"))
     p = sub.add_parser("record", help="log a non-Tavily lookup (host-provided search/fetch) for dedupe")
@@ -702,63 +1013,73 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--reason", required=True)
     for name in ("summary", "audit"):
         sub.add_parser(name).add_argument("run_dir", type=Path)
+    sub.add_parser("dossier-check", help="pre-write guard for the run-specific dossier limit").add_argument("run_dir", type=Path)
     ns = ap.parse_args(argv)
 
     if ns.cmd == "check":
         ok, message = preflight()
-        print(message)
+        safe_print(message)
         return 0 if ok else 3
     if ns.cmd == "init":
-        led = Ledger.init(ns.run_dir, ns.profile, ns.budget)
-        print(f"Initialised {ns.run_dir / LEDGER_NAME}: profile={ns.profile}, budget={led.limit} credits")
+        try:
+            led = Ledger.init(ns.run_dir, ns.profile, ns.budget, max_operations=ns.max_operations,
+                              max_dossiers=ns.max_dossiers, strict_credit_bounds=ns.strict_credit_bounds)
+        except ValueError as exc:
+            safe_print(redact(str(exc)), file=sys.stderr)
+            return 2
+        safe_print(f"Initialised {ns.run_dir / LEDGER_NAME}: profile={ns.profile}, budget={led.limit} credits")
         return 0
     if ns.cmd == "audit":
         problems = audit_run(ns.run_dir)
-        print("\n".join(problems) if problems else "All evidence-ledger claims cite defined sources.")
+        safe_print("\n".join(problems) if problems else "All evidence-ledger claims cite defined sources.")
         for w in audit_warnings(ns.run_dir):
-            print(f"WARNING: {w}")
+            safe_print(w)
         return 1 if problems else 0
+    if ns.cmd == "dossier-check":
+        allowed, message = Ledger.load(ns.run_dir).dossier_capacity()
+        safe_print(message)
+        return 0 if allowed else 2
     led = Ledger.load(ns.run_dir)
     if ns.cmd == "plan":
-        print(json.dumps(led.plan(ns.op, ns.target, _params(ns)), indent=1))
+        safe_print(json.dumps(led.plan(ns.op, ns.target, _params(ns)), indent=1, ensure_ascii=True))
         return 0
     if ns.cmd == "run":
         res = run_operation(led, ns.op, ns.target, _params(ns))
         d = res["decision"]
         if not res["executed"]:
-            print(f"{d['status']}: not executed. {d.get('reason', '')} {' '.join(d['notes'])}".strip())
+            safe_print(redact(f"{d['status']}: not executed. {d.get('reason', '')} {' '.join(d['notes'])}".strip()))
             if d.get("reuse"):
-                print(f"Reuse cached result: {ns.run_dir / d['reuse']}")
+                safe_print(f"Reuse cached result: {ns.run_dir / d['reuse']}")
             return 0 if d["status"] in (DUPLICATE, SKIP_KNOWN_GAP) else 2
         if res.get("payload") is not None:
             compact_print(ns.op, res["payload"])
-            print(f"\n[{res['entry']['id']}] {d['status']} est. {d['est_credits']} credits ({d['basis']}); "
+            safe_print(f"\n[{res['entry']['id']}] {d['status']} est. {d['est_credits']} credits ({d['basis']}); "
                   f"run total {led.spent}/{led.limit}, remaining {led.remaining} (estimated); "
                   f"full output: {ns.run_dir / res['entry']['cache_file']}")
             return 0
-        print(f"[{res['entry']['id']}] FAILED: {res['message']}")
+        safe_print(redact(f"[{res['entry']['id']}] FAILED: {res['message']}"))
         return 3 if res.get("stop") else 1
     if ns.cmd == "record":
         decision = led.plan(ns.op, ns.target, _params(ns))
         decision.setdefault("est_credits", 0)
         entry = led.record(decision, ns.status, [{"url": u} for u in ns.result_url], tool=ns.tool)
-        print(f"Recorded {entry['id']} ({ns.tool}, no Tavily credits)")
+        safe_print(f"Recorded {entry['id']} ({ns.tool}, no Tavily credits)")
         return 0
     if ns.cmd == "gap":
         led.record_gap(ns.url, ns.reason, method=ns.method, tried=ns.tried, impact=ns.impact)
-        print("Coverage gap recorded (not evidence of absent demand).")
+        safe_print("Coverage gap recorded (not evidence of absent demand).")
         return 0
     if ns.cmd == "set-profile":
         led.set_profile(ns.profile, ns.reason, ns.budget)
-        print(f"Profile now {ns.profile}; budget {led.limit}, remaining {led.remaining} est. credits.")
+        safe_print(f"Profile now {ns.profile}; budget {led.limit}, remaining {led.remaining} est. credits.")
         return 0
     if ns.cmd == "approve":
         led.approve(ns.credits, ns.research_calls, ns.allow_crawl, ns.reason)
-        print(f"Approval recorded; budget now {led.limit} credits.")
+        safe_print(f"Approval recorded; budget now {led.limit} credits.")
         return 0
     if ns.cmd == "summary":
         (ns.run_dir / USAGE_NAME).write_text(led.summary_markdown(), encoding="utf-8")
-        print(f"Wrote {ns.run_dir / USAGE_NAME}: {led.spent}/{led.limit} est. credits, "
+        safe_print(f"Wrote {ns.run_dir / USAGE_NAME}: {led.spent}/{led.limit} est. credits, "
               f"{len(led.data['coverage_gaps'])} coverage gap(s)")
         return 0
     return 2

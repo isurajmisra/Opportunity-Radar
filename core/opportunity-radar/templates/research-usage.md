@@ -13,6 +13,8 @@ Complete this file for every run, including when no external providers were call
 | Operation ID | Provider | Operation | Query / URL reference | Status | Actual usage | Estimate and basis | Retrieved at |
 |---|---|---|---|---|---|---|---|
 
+For source-level extraction, report successful extraction, confirmed source access failure, command/configuration failure (retry eligible), provider/network failure with unknown source status, and not attempted separately. Include attempt IDs and a concise reason. Local preflight/argument failures are logged but are not provider operations; attempted provider failures count. Keep this table and the executive summary consistent with the underlying ledger. Tavily CLI credits are estimates unless provider-reported usage is available.
+
 ## Coverage gaps
 
 | Provider/source | Access issue | Alternatives tried | Effect on conclusions |
